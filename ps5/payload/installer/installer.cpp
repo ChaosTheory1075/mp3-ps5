@@ -1,0 +1,1401 @@
+/* Max Payne 3 RePrescribed - the installer payload: the install's writing, at the drive's full speed.
+ *
+ * GTA IV for PS5's installer payload (elripalda/gta4-ps5, ps5/payload/installer, itself Recomp
+ * Store's copier) made for Crackdown and Max Payne 3: the same job and status files, the same disc image and
+ * content package readers, without GTA IV's archive unpacking. The app sends it to the console's
+ * payload loader on port 9021 (etaHEN, elfldr or any other), so the writing happens in a process
+ * of its own: the PS5 lets an app write about a gigabyte quickly and then slows it to a few MB/s
+ * (the app's own install wrote at 2 MB/s); a payload writes at the drive's full speed, as an FTP
+ * server does.
+ *
+ * The app leaves the job in its own folder:
+ *     <app>/UserData/mp3/.install-job/job.txt
+ * It sees that folder as /app0; this finds where it really is (/data/homebrew/..., a drive under
+ * /mnt, under any name) by looking for that file. Paths in the job are inside the app's folder.
+ *   The game:
+ *     kind=game
+ *     token=<number the app chose>
+ *     staging=UserData/mp3/.install-staging
+ *     image=install/<the disc image, or a folder of the disc's files>
+ *     image_kind=iso|folder
+ *     disc_root=<the disc's folder with default.xex in it; empty: the top>
+ *     update=install/<the title update's package, or empty>
+ *     update_kind=package|none
+ *     update_root=<the package's folder with default.xexp in it>
+ *     update_xexp=<default.xexp's name in the package>
+ *     needed=<bytes the install needs free>
+ *   copies the disc's files into <staging>/game (and the title update's into game/update, its
+ *   default.xexp beside default.xex too).
+ *   A content package (a DLC pack, or the title update by itself):
+ *     kind=package
+ *     staging=...  source=install/<the package>  root=<its folder to copy; empty: all>
+ *     target=<where in the staging folder: dlc/<name>, update>
+ *     needed=...
+ *   copies the package's files into <staging>/<target>.
+ * The app then checks them and moves them into place.
+ *
+ * It takes the job by renaming job.txt to job.taken (the app takes back a job nobody took by
+ * deleting job.txt, so only one of them ever has it), one installer at a time (a lock on
+ * "running"). Progress goes to status.txt there twice a second (written beside and renamed over,
+ * so the app never reads half of it). A file called "cancel" there stops it, as does job.taken
+ * going away or becoming another job's. A stopped or failed install's files are removed, but
+ * only its own: the staging folder carries the job's token (.token). Nothing is written outside
+ * the staging folder but the job folder and logs/installer.log (and
+ * /data/mp3-ps5-installer.log when no job can be found). No notifications.
+ * SPDX-License-Identifier: GPL-3.0-or-later */
+
+#include "store_disc.hpp"
+#include "store_stfs.hpp"
+#include "store_zip.hpp"
+
+#include "gta4_install_io.h" /* GTA IV for PS5's install reading and writing (include/) */
+
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+#include <zlib.h>
+#include "mp3_textures_core.h" /* Max Payne 3's HD textures from the Nexus pack (the app's, copied in) */
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <condition_variable>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <deque>
+#include <dirent.h>
+#include <fcntl.h>
+#include <filesystem>
+#include <mutex>
+#include <set>
+#include <string>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#if defined(__PROSPERO__) || defined(__FreeBSD__)
+#define HAVE_MOUNTS 1
+#include <sys/mount.h>
+#include <sys/param.h>
+#else
+#define HAVE_MOUNTS 0
+#include <sys/statvfs.h>
+#endif
+
+namespace
+{
+namespace fs = std::filesystem;
+namespace io = gta4::install::io;
+
+/* Where the app leaves the job, inside its folder, and the only folder this empties. */
+const char *const kJobRel = "UserData/mp3/.install-job";
+const char *const kStagingRel = "UserData/mp3/.install-staging";
+/* A job.txt older than this (seconds) is an old one. */
+constexpr double kFreshJob = 600;
+
+std::string g_app, g_jobdir, g_log;
+std::atomic<bool> g_cancel{false}, g_quit{false};
+/* The job became another one (a newer install took it over): this one stops, quietly. */
+std::atomic<bool> g_superseded{false};
+std::mutex g_log_mutex, g_status_mutex;
+
+double now_s()
+{
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return double(ts.tv_sec) + double(ts.tv_nsec) / 1e9;
+}
+
+void log_line(const char *fmt, ...)
+{
+    char body[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(body, sizeof body, fmt, ap);
+    va_end(ap);
+    if (g_log.empty())
+        return;
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&now, &tm);
+    char stamp[32];
+    std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", &tm);
+    std::lock_guard<std::mutex> l(g_log_mutex);
+    if (std::FILE *f = std::fopen(g_log.c_str(), "a"))
+    {
+        std::fprintf(f, "%s  installer: %s\n", stamp, body);
+        std::fclose(f);
+    }
+}
+
+bool read_text(const std::string &path, std::string &out)
+{
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    out.clear();
+    char buf[4096];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0)
+        out.append(buf, n);
+    std::fclose(f);
+    return true;
+}
+
+std::string field(const std::string &text, const char *key)
+{
+    const std::string k = std::string(key) + "=";
+    std::size_t at = 0;
+    while (at < text.size())
+    {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        if (text.compare(at, k.size(), k) == 0)
+            return text.substr(at + k.size(), end - at - k.size());
+        at = end + 1;
+    }
+    return "";
+}
+
+bool exists(const std::string &p)
+{
+    struct stat st;
+    return stat(p.c_str(), &st) == 0;
+}
+
+std::string lower(std::string s)
+{
+    for (char &c : s)
+        c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string mb(std::uint64_t bytes)
+{
+    char buf[32];
+    if (bytes >= (1ull << 30))
+        std::snprintf(buf, sizeof buf, "%.1f GB", double(bytes) / double(1ull << 30));
+    else
+        std::snprintf(buf, sizeof buf, "%.0f MB", double(bytes) / double(1ull << 20));
+    return buf;
+}
+
+/* `path` inside the folder `root` ("" for everything): what's left of it. */
+bool under(const std::string &path, const std::string &root, std::string &rel)
+{
+    if (root.empty())
+    {
+        rel = path;
+        return true;
+    }
+    if (path.size() <= root.size() + 1 || path[root.size()] != '/' || lower(path.substr(0, root.size())) != lower(root))
+        return false;
+    rel = path.substr(root.size() + 1);
+    return true;
+}
+
+bool write_all(int fd, const std::uint8_t *data, std::size_t n)
+{
+    while (n)
+    {
+        const ssize_t w = ::write(fd, data, n);
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w <= 0)
+            return false;
+        data += w;
+        n -= std::size_t(w);
+    }
+    return true;
+}
+
+/* ---- What the app reads: status.txt ---------------------------------------------- */
+
+struct Status
+{
+    std::mutex m; /* the strings and the step */
+    std::string token, phase = "starting", error, drive;
+    int step = 0;
+    std::uint64_t free = 0, unpack_guess = 0, beat = 0;
+    std::atomic<std::uint64_t> copy_done{0}, copy_total{0}, unpack_done{0}, unpack_total{0};
+    double t0 = 0;
+};
+Status g;
+
+std::string one_line(std::string s)
+{
+    for (char &c : s)
+        if (c == '\n' || c == '\r')
+            c = ' ';
+    return s;
+}
+
+/* Whole, at once: written beside, then renamed over. */
+void write_status()
+{
+    std::lock_guard<std::mutex> w(g_status_mutex);
+    if (g_superseded.load())
+        return; /* (status.txt is the newer job's) */
+    std::string file;
+    std::uint64_t file_size = 0;
+    io::Current(file, file_size);
+    file = file.substr(file.find_last_of('/') + 1);
+    const io::Stats &s = io::GetStats();
+    std::string text;
+    {
+        std::lock_guard<std::mutex> l(g.m);
+        char buf[1024];
+        std::snprintf(buf, sizeof buf,
+                      "token=%s\nphase=%s\nstep=%d\ncopy_done=%llu\ncopy_total=%llu\nunpack_done=%llu\nunpack_total=%llu\n"
+                      "unpack_guess=%llu\nseconds=%.1f\nfile_size=%llu\nread_bytes=%llu\nread_ns=%llu\nwrite_bytes=%llu\n"
+                      "write_ns=%llu\nfree=%llu\nbeat=%llu\n",
+                      g.token.c_str(), g.phase.c_str(), g.step, (unsigned long long)g.copy_done.load(),
+                      (unsigned long long)g.copy_total.load(), (unsigned long long)g.unpack_done.load(),
+                      (unsigned long long)g.unpack_total.load(), (unsigned long long)g.unpack_guess, now_s() - g.t0,
+                      (unsigned long long)file_size, (unsigned long long)s.read_bytes.load(),
+                      (unsigned long long)s.read_ns.load(), (unsigned long long)s.write_bytes.load(),
+                      (unsigned long long)s.write_ns.load(), (unsigned long long)g.free, (unsigned long long)++g.beat);
+        text = buf;
+        text += "file=" + one_line(file) + "\nfolder=" + one_line(g_app) + "\ndrive=" + one_line(g.drive) +
+                "\nerror=" + one_line(g.error) + "\n";
+    }
+    const std::string tmp = g_jobdir + "/status.tmp", fin = g_jobdir + "/status.txt";
+    static bool failing = false; /* (logged once each time it starts failing) */
+    bool ok = false;
+    if (std::FILE *f = std::fopen(tmp.c_str(), "wb"))
+    {
+        ok = std::fputs(text.c_str(), f) >= 0;
+        ok = std::fclose(f) == 0 && ok;
+        chmod(tmp.c_str(), 0666);
+        ok = ok && std::rename(tmp.c_str(), fin.c_str()) == 0;
+    }
+    if (!ok && !failing)
+        log_line("couldn't write status.txt (error %d)", errno);
+    failing = !ok;
+}
+
+void set_phase(const char *phase, int step = -1)
+{
+    {
+        std::lock_guard<std::mutex> l(g.m);
+        g.phase = phase;
+        if (step >= 0)
+            g.step = step;
+    }
+    write_status();
+}
+
+/* Four times a second: is there a cancel file? Twice a second: the status. Every
+ * 10 s: a line in the log. */
+void status_main()
+{
+    int tick = 0;
+    while (!g_quit.load())
+    {
+        usleep(250000);
+        /* a cancel file; or job.taken gone (the app let the job go) or another job's */
+        if (!g_cancel.load())
+        {
+            std::string taken;
+            const bool asked = exists(g_jobdir + "/cancel");
+            const bool ours = read_text(g_jobdir + "/job.taken", taken) && field(taken, "token") == g.token;
+            if (!ours)
+                g_superseded = true;
+            if (asked || !ours)
+            {
+                g_cancel = true;
+                log_line(asked ? "the app asked to stop" : "the job isn't this installer's any more; stopping");
+            }
+        }
+        if (++tick % 2 == 0)
+            write_status();
+        if (tick % 40 == 0)
+        {
+            std::uint64_t guess;
+            {
+                std::lock_guard<std::mutex> l(g.m);
+                guess = g.unpack_guess;
+            }
+            const io::Stats &s = io::GetStats();
+            const double rs = double(s.read_ns.load()) / 1e9, ws = double(s.write_ns.load()) / 1e9;
+            log_line("%.0f s: copied %s of %s, unpacked %s of %s; reading %.0f s (%.0f MB/s), writing %.0f s (%.0f MB/s)",
+                     now_s() - g.t0, mb(g.copy_done).c_str(), mb(g.copy_total).c_str(), mb(g.unpack_done).c_str(),
+                     mb(std::max<std::uint64_t>(g.unpack_total, guess)).c_str(), rs,
+                     rs > 0 ? double(s.read_bytes.load()) / 1048576.0 / rs : 0.0, ws,
+                     ws > 0 ? double(s.write_bytes.load()) / 1048576.0 / ws : 0.0);
+        }
+    }
+}
+
+/* A folder and everything in it, as rm -rf does; `removed` counts what went. Not
+ * std::filesystem::remove_all: in the payload SDK's libc, the openat and unlinkat it is
+ * built on are bare system calls that hand back a failure's error number as if it were
+ * a result (a file handle, or success), so it misread an earlier install's folder and
+ * every reinstall stopped. These calls (the system's own) report errors properly. */
+bool remove_tree(const std::string &path, std::uint64_t &removed, std::string &error)
+{
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0)
+    {
+        if (errno == ENOENT)
+            return true;
+        error = path + ": " + std::strerror(errno);
+        return false;
+    }
+    if (S_ISDIR(st.st_mode))
+    {
+        /* (the names first, then the removing: nothing changes under readdir) */
+        std::vector<std::string> names;
+        DIR *d = opendir(path.c_str());
+        if (!d)
+        {
+            error = path + ": " + std::strerror(errno);
+            return false;
+        }
+        while (dirent *e = readdir(d))
+            if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0)
+                names.push_back(e->d_name);
+        closedir(d);
+        for (const std::string &name : names)
+            if (!remove_tree(path + "/" + name, removed, error))
+                return false;
+        if (rmdir(path.c_str()) != 0)
+        {
+            error = path + ": " + std::strerror(errno);
+            return false;
+        }
+    }
+    else if (unlink(path.c_str()) != 0)
+    {
+        error = path + ": " + std::strerror(errno);
+        return false;
+    }
+    ++removed;
+    return true;
+}
+
+/* The end of a stopped or failed install: its files removed (`staging`, when it got
+ * that far), then phase=stopped or failed. */
+int fail(std::string why, const std::string &staging = std::string())
+{
+    const bool stopped = g_cancel.load();
+    if (stopped)
+        why = "Stopped.";
+    log_line("%s: %s", stopped ? "stopped" : "failed", why.c_str());
+    /* Its files go, if they're still its own (the staging folder carries its token). */
+    std::string mark;
+    if (!staging.empty() && !g_superseded.load() && read_text(staging + "/.token", mark) && mark == g.token)
+    {
+        set_phase("cleaning");
+        std::uint64_t removed = 0;
+        std::string error;
+        if (!remove_tree(staging, removed, error))
+            log_line("couldn't remove %s: %s", staging.c_str(), error.c_str());
+        else
+            log_line("removed %s (%llu files and folders)", staging.c_str(), (unsigned long long)removed);
+    }
+    {
+        std::lock_guard<std::mutex> l(g.m);
+        g.phase = stopped ? "stopped" : "failed";
+        g.error = why;
+    }
+    write_status();
+    return 1;
+}
+
+/* ---- Where the app is ------------------------------------------------------------- */
+
+void add_place(std::vector<std::string> &places, std::string p)
+{
+    while (p.size() > 1 && p.back() == '/')
+        p.pop_back();
+    if (p.size() < 2 || p[0] != '/')
+        return;
+    if (std::find(places.begin(), places.end(), p) == places.end())
+        places.push_back(p);
+}
+
+void add_folders_in(std::vector<std::string> &places, const std::string &dir)
+{
+    DIR *d = opendir(dir.c_str());
+    if (!d)
+        return;
+    while (dirent *e = readdir(d))
+        if (e->d_name[0] != '.')
+            add_place(places, dir + "/" + e->d_name);
+    closedir(d);
+}
+
+/* Through the console's own mounts the app's folder may be seen at several paths (the
+ * app sees /app0, the console mounts it from where it really is): its real place first. */
+int rank_of(const std::string &p)
+{
+    if (p.rfind("/mnt/sandbox/", 0) == 0)
+        return 2;
+    if (p.rfind("/system_ex/", 0) == 0)
+        return 1;
+    return 0;
+}
+
+/* The app's folder: the one holding the newest fresh job. */
+bool find_app(std::string &app)
+{
+    std::vector<std::string> places;
+#ifdef GTA4_TEST_ROOT
+    add_folders_in(places, GTA4_TEST_ROOT);
+#else
+#if HAVE_MOUNTS
+    /* every mount: a homebrew app's folder is mounted (nullfs) where the app is run from */
+    struct statfs *mounts = nullptr;
+    const int n = getmntinfo(&mounts, MNT_NOWAIT);
+    for (int i = 0; i < n; ++i)
+    {
+        add_place(places, mounts[i].f_mntfromname);
+        add_place(places, mounts[i].f_mntonname);
+    }
+#endif
+    /* and where homebrew apps usually are */
+    add_folders_in(places, "/data/homebrew");
+    add_folders_in(places, "/user/data/homebrew");
+    for (const char *kind : {"usb", "ext"})
+        for (int i = 0; i < 8; ++i)
+        {
+            const std::string drive = "/mnt/" + std::string(kind) + std::to_string(i);
+            add_folders_in(places, drive + "/homebrew");
+            add_folders_in(places, drive);
+        }
+    add_folders_in(places, "/data");
+    add_folders_in(places, "/system_ex/app");
+#endif
+    const std::time_t now = std::time(nullptr);
+    bool found = false;
+    struct stat best{};
+    int best_rank = 0;
+    /* (no job anywhere: what was looked at, for whoever looks into it) */
+    struct Note
+    {
+        const std::vector<std::string> &places;
+        const bool &found;
+        ~Note()
+        {
+            if (found)
+                return;
+#ifdef GTA4_TEST_ROOT
+            std::FILE *f = std::fopen(GTA4_TEST_ROOT "/installer-no-job.log", "a");
+#else
+            std::FILE *f = std::fopen("/data/mp3-ps5-installer.log", "a");
+#endif
+            if (!f)
+                return;
+            std::fprintf(f, "%ld  installer: no fresh %s/job.txt in any of %zu folders:", long(std::time(nullptr)), kJobRel,
+                         places.size());
+            for (const std::string &p : places)
+                if (p.find("homebrew") != std::string::npos || p.find("PPSA") != std::string::npos)
+                    std::fprintf(f, " %s", p.c_str());
+            std::fprintf(f, "\n");
+            std::fclose(f);
+        }
+    } note{places, found};
+    for (const std::string &p : places)
+    {
+        struct stat st, eboot;
+        if (stat((p + "/" + kJobRel + "/job.txt").c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
+            std::difftime(now, st.st_mtime) > kFreshJob || stat((p + "/eboot.bin").c_str(), &eboot) != 0)
+            continue;
+        const int rank = rank_of(p);
+        const bool same = found && st.st_ino == best.st_ino && st.st_mtime == best.st_mtime;
+        if (!found || (same ? rank < best_rank : st.st_mtime > best.st_mtime))
+        {
+            app = p;
+            best = st;
+            best_rank = rank;
+            found = true;
+        }
+    }
+    return found;
+}
+
+/* The drive the app's folder is on: its kind and what's mounted, and its free space. */
+void drive_of(const std::string &path)
+{
+    std::lock_guard<std::mutex> l(g.m);
+#if HAVE_MOUNTS
+    struct statfs sf;
+    if (statfs(path.c_str(), &sf) == 0)
+    {
+        g.drive = std::string(sf.f_fstypename) + " " + sf.f_mntfromname;
+        g.free = std::uint64_t(sf.f_bavail) * std::uint64_t(sf.f_bsize);
+    }
+#else
+    struct statvfs sv;
+    if (statvfs(path.c_str(), &sv) == 0)
+    {
+        g.drive = "local";
+        g.free = std::uint64_t(sv.f_bavail) * std::uint64_t(sv.f_frsize);
+    }
+#endif
+}
+
+/* ---- 1. The disc's files ----------------------------------------------------------- */
+
+struct DiscItem
+{
+    const recomp::DiscFile *file;
+    std::string rel; /* where it goes, inside the game's folder */
+};
+
+constexpr std::size_t kBlock = 16u << 20;
+constexpr int kBlocks = 3;
+/* Files copied at once on the console's own drive: one writer there managed about
+ * 190 MB/s while the disc image read at over 700, so three files go at once, each in a
+ * lane of its own (a reader and a writer). On a USB drive one at a time, as before (a
+ * hard drive would only seek between them). */
+constexpr int kLanes = 3;
+
+/* A lane's reader thread fills kBlock pieces in disc order, its writer writes them. */
+struct Pipe
+{
+    std::mutex m;
+    std::condition_variable cv;
+    std::uint8_t *data[kBlocks] = {};
+    std::size_t size[kBlocks] = {};
+    std::deque<int> full; /* oldest first */
+    std::vector<int> free;
+    bool stop = false, reader_done = false, read_failed = false;
+    std::string bad;
+};
+
+void read_files(Pipe &p, recomp::Disc &disc, const std::vector<DiscItem> &items)
+{
+    for (const DiscItem &it : items)
+    {
+        std::uint64_t off = std::uint64_t(it.file->sector) * 2048, left = it.file->size;
+        while (left)
+        {
+            int bi;
+            {
+                std::unique_lock<std::mutex> l(p.m);
+                p.cv.wait(l, [&] { return !p.free.empty() || p.stop; });
+                if (p.stop)
+                    return;
+                bi = p.free.back();
+                p.free.pop_back();
+            }
+            const std::size_t n = std::size_t(std::min<std::uint64_t>(left, kBlock));
+            const std::uint64_t t0 = io::detail::NowNs();
+            const bool ok = disc.read(off, p.data[bi], n);
+            io::GetStats().read_ns += io::detail::NowNs() - t0;
+            {
+                std::lock_guard<std::mutex> l(p.m);
+                if (!ok)
+                {
+                    p.read_failed = true;
+                    p.bad = it.rel;
+                    p.free.push_back(bi);
+                    p.cv.notify_all();
+                    return;
+                }
+                io::GetStats().read_bytes += n;
+                p.size[bi] = n;
+                p.full.push_back(bi);
+            }
+            p.cv.notify_all();
+            off += n;
+            left -= n;
+        }
+    }
+}
+
+/* One lane: its files, in disc order, through its blocks. Stops when another lane
+ * failed (`abort`), leaving `error` empty. */
+void copy_lane(recomp::Disc &disc, const std::vector<DiscItem> &items, const std::string &game,
+               std::uint8_t *const *blocks, std::atomic<bool> &abort, std::string &error)
+{
+    Pipe p;
+    for (int i = 0; i < kBlocks; ++i)
+    {
+        p.data[i] = blocks[i];
+        p.free.push_back(i);
+    }
+    std::thread reader([&] {
+        read_files(p, disc, items);
+        std::lock_guard<std::mutex> l(p.m);
+        p.reader_done = true;
+        p.cv.notify_all();
+    });
+
+    std::set<std::string> made;
+    for (const DiscItem &it : items)
+    {
+        if (abort.load())
+            break;
+        const std::string dst = game + "/" + it.rel;
+        const std::string dir = dst.substr(0, dst.find_last_of('/'));
+        if (made.insert(dir).second)
+            recomp::zip::make_dirs(dir);
+        const int fd = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0)
+        {
+            error = "Couldn't create " + it.rel + " (error " + std::to_string(errno) + ").";
+            break;
+        }
+        io::SetCurrent(dst, it.file->size);
+        std::uint64_t left = it.file->size;
+        bool ok = true;
+        while (left && ok)
+        {
+            int bi;
+            {
+                std::unique_lock<std::mutex> l(p.m);
+                p.cv.wait(l, [&] { return !p.full.empty() || p.read_failed || p.reader_done; });
+                if (p.full.empty())
+                {
+                    error = "The disc image couldn't be read at " + (p.bad.empty() ? it.rel : p.bad) +
+                            ". It may be incomplete.";
+                    ok = false;
+                    break;
+                }
+                bi = p.full.front();
+                p.full.pop_front();
+            }
+            const std::size_t n = p.size[bi];
+            const std::uint64_t t0 = io::detail::NowNs();
+#ifdef GTA4_TEST_SLOW
+            usleep(GTA4_TEST_SLOW); /* the desktop test only: a slow drive */
+#endif
+            const bool wrote = write_all(fd, p.data[bi], n);
+            const int why = errno;
+            io::GetStats().write_ns += io::detail::NowNs() - t0;
+            if (wrote)
+                io::GetStats().write_bytes += n;
+            {
+                std::lock_guard<std::mutex> l(p.m);
+                p.free.push_back(bi);
+            }
+            p.cv.notify_all();
+            if (!wrote)
+            {
+                error = "Writing " + it.rel + " failed (error " + std::to_string(why) + "). Is the drive full?";
+                ok = false;
+                break;
+            }
+            left -= n;
+            g.copy_done += n;
+            if (g_cancel.load())
+            {
+                error = "Stopped.";
+                ok = false;
+            }
+            else if (abort.load())
+                ok = false;
+        }
+        if (::close(fd) != 0 && ok)
+        {
+            error = "Writing " + it.rel + " failed. Is the drive full?";
+            ok = false;
+        }
+        if (!ok)
+            break;
+    }
+    if (!error.empty())
+        abort = true;
+    {
+        std::lock_guard<std::mutex> l(p.m);
+        p.stop = true;
+    }
+    p.cv.notify_all();
+    reader.join();
+}
+
+bool on_console_drive(const std::string &path)
+{
+#ifdef GTA4_TEST_ROOT
+    return !std::getenv("GTA4_TEST_USB"); /* (the desktop test: as the console's drive, or a USB one) */
+#endif
+    return path.rfind("/data/", 0) == 0 || path.rfind("/user/", 0) == 0 || path.rfind("/system_ex/", 0) == 0;
+}
+
+bool copy_disc(recomp::Disc &disc, const std::vector<DiscItem> &items, const std::string &game, std::string &error)
+{
+    /* The lanes (fewer if there's not the memory for all of them) */
+    int lanes = int(std::min<std::size_t>(on_console_drive(game) ? kLanes : 1, std::max<std::size_t>(items.size(), 1)));
+    std::vector<std::uint8_t *> blocks;
+    for (;; --lanes)
+    {
+        for (int i = 0; i < lanes * kBlocks; ++i)
+            if (std::uint8_t *b = static_cast<std::uint8_t *>(std::malloc(kBlock)))
+                blocks.push_back(b);
+            else
+                break;
+        if (int(blocks.size()) == lanes * kBlocks)
+            break;
+        for (std::uint8_t *b : blocks)
+            std::free(b);
+        blocks.clear();
+        if (lanes == 1)
+        {
+            error = "The installer couldn't get memory to copy with.";
+            return false;
+        }
+    }
+    /* The files shared out, the biggest first to the lane with the least so far; each
+     * lane then reads its own in disc order. */
+    const std::size_t lane_count = std::size_t(lanes);
+    std::vector<std::vector<DiscItem>> work(lane_count);
+    {
+        std::vector<const DiscItem *> by_size;
+        for (const DiscItem &it : items)
+            by_size.push_back(&it);
+        std::stable_sort(by_size.begin(), by_size.end(),
+                         [](const DiscItem *a, const DiscItem *b) { return a->file->size > b->file->size; });
+        std::vector<std::uint64_t> load(lane_count, 0);
+        for (const DiscItem *it : by_size)
+        {
+            const std::size_t k = std::size_t(std::min_element(load.begin(), load.end()) - load.begin());
+            work[k].push_back(*it);
+            load[k] += it->file->size + 4096; /* (a file's own cost, too) */
+        }
+        for (auto &w : work)
+            std::sort(w.begin(), w.end(),
+                      [](const DiscItem &a, const DiscItem &b) { return a.file->sector < b.file->sector; });
+    }
+    if (lanes > 1)
+        log_line("copying in %d lanes at once", lanes);
+    std::atomic<bool> abort{false};
+    std::vector<std::string> errors(lane_count);
+    std::vector<std::thread> others;
+    for (int k = 1; k < lanes; ++k)
+        others.emplace_back([&, k] {
+            copy_lane(disc, work[std::size_t(k)], game, blocks.data() + k * kBlocks, abort, errors[std::size_t(k)]);
+        });
+    copy_lane(disc, work[0], game, blocks.data(), abort, errors[0]);
+    for (std::thread &t : others)
+        t.join();
+    for (std::uint8_t *b : blocks)
+        std::free(b);
+    for (const std::string &e : errors)
+        if (!e.empty() && error.empty())
+            error = e;
+    if (!error.empty())
+        return false;
+    /* every file there, at its size */
+    for (const DiscItem &it : items)
+    {
+        struct stat st;
+        if (stat((game + "/" + it.rel).c_str(), &st) != 0 || std::uint64_t(st.st_size) != it.file->size)
+        {
+            error = it.rel + " didn't copy whole.";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string leaf(const std::string &path) { return path.substr(path.find_last_of('/') + 1); }
+
+std::uint64_t size_of(const std::string &path)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 ? std::uint64_t(st.st_size) : 0;
+}
+
+/* One file into another, counted as copied. */
+bool copy_file(const std::string &from, const std::string &to, std::string &error)
+{
+    const int in = ::open(from.c_str(), O_RDONLY);
+    if (in < 0)
+    {
+        error = "Couldn't read " + leaf(from) + ".";
+        return false;
+    }
+    const int out = ::open(to.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out < 0)
+    {
+        ::close(in);
+        error = "Couldn't create " + leaf(to) + ".";
+        return false;
+    }
+    io::SetCurrent(to, size_of(from));
+    std::vector<std::uint8_t> buf(8u << 20);
+    bool read_ok = true, write_ok = true;
+    for (;;)
+    {
+        if (g_cancel.load())
+        {
+            error = "Stopped.";
+            break;
+        }
+        const std::uint64_t r0 = io::detail::NowNs();
+        const ssize_t n = ::read(in, buf.data(), buf.size());
+        io::GetStats().read_ns += io::detail::NowNs() - r0;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0)
+            read_ok = false;
+        if (n <= 0)
+            break;
+        io::GetStats().read_bytes += std::uint64_t(n);
+        const std::uint64_t w0 = io::detail::NowNs();
+        write_ok = write_all(out, buf.data(), std::size_t(n));
+        io::GetStats().write_ns += io::detail::NowNs() - w0;
+        if (!write_ok)
+            break;
+        io::GetStats().write_bytes += std::uint64_t(n);
+        g.copy_done += std::uint64_t(n);
+    }
+    ::close(in);
+    if (::close(out) != 0)
+        write_ok = false;
+    if (!error.empty())
+        return false;
+    if (!read_ok)
+    {
+        error = leaf(from) + " couldn't be read. It may be incomplete.";
+        return false;
+    }
+    if (!write_ok)
+    {
+        error = "Writing " + leaf(to) + " failed. Is the drive full?";
+        return false;
+    }
+    return true;
+}
+
+/* A game folder (a disc's files copied out already): every file in it, with its path. */
+struct FolderItem
+{
+    std::string from, rel;
+    std::uint64_t size;
+};
+
+bool list_folder(const std::string &dir, std::vector<FolderItem> &out, std::string &error)
+{
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+    {
+        std::error_code type_ec;
+        if (!it->is_regular_file(type_ec))
+            continue;
+        out.push_back({it->path().string(), it->path().lexically_relative(dir).generic_string(),
+                       std::uint64_t(it->file_size(type_ec))});
+    }
+    if (ec)
+    {
+        error = "The game folder couldn't be read (" + ec.message() + ").";
+        return false;
+    }
+    return true;
+}
+
+/* A content package's files under `root` into `target` (`what` names it in messages:
+ * "The title update"; `shown` is the target's name: "update/"). */
+bool copy_package_files(recomp::stfs::Package &pkg, const std::string &root, const std::string &target, const char *what,
+                        const std::string &shown, std::string &error, const std::string &xexp = std::string(),
+                        std::string *xexp_copy = nullptr)
+{
+    for (const recomp::stfs::Entry &e : pkg.entries())
+    {
+        std::string rel;
+        if (!under(e.name, root, rel))
+            continue;
+        if (!recomp::zip::safe_name(rel))
+        {
+            error = std::string(what) + " has a file with an unsafe name.";
+            return false;
+        }
+        const std::string dst = target + "/" + rel;
+        recomp::zip::make_dirs(dst.substr(0, dst.find_last_of('/')));
+        const int fd = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0)
+        {
+            error = "Couldn't create " + shown + rel + ".";
+            return false;
+        }
+        io::SetCurrent(dst, e.size);
+        bool wrote = true;
+        const bool read = pkg.read(e, [&](const std::uint8_t *data, std::size_t n) {
+            if (g_cancel.load())
+                return false;
+            const std::uint64_t t0 = io::detail::NowNs();
+            wrote = write_all(fd, data, n);
+            io::GetStats().write_ns += io::detail::NowNs() - t0;
+            if (!wrote)
+                return false;
+            io::GetStats().write_bytes += n;
+            g.copy_done += n;
+            return true;
+        });
+        const bool closed = ::close(fd) == 0;
+        struct stat st;
+        if (g_cancel.load())
+        {
+            error = "Stopped.";
+            return false;
+        }
+        if (!wrote || !closed)
+        {
+            error = "Writing " + shown + rel + " failed. Is the drive full?";
+            return false;
+        }
+        if (!read || stat(dst.c_str(), &st) != 0 || std::uint64_t(st.st_size) != e.size)
+        {
+            error = std::string(what) + " couldn't be read at " + e.name + ". It may be incomplete.";
+            return false;
+        }
+        if (xexp_copy && lower(e.name) == lower(xexp))
+            *xexp_copy = dst;
+    }
+    return true;
+}
+
+/* The title update's package: its files under `root` into <game>/update, and its
+ * default.xexp (`xexp`, its name in the package) also beside default.xex. */
+bool copy_package(recomp::stfs::Package &pkg, const std::string &root, const std::string &xexp, const std::string &game,
+                  std::string &error)
+{
+    std::string xexp_copy;
+    if (!copy_package_files(pkg, root, game + "/update", "The title update", "update/", error, xexp, &xexp_copy))
+        return false;
+    if (xexp_copy.empty())
+    {
+        error = "The title update has no default.xexp.";
+        return false;
+    }
+    return copy_file(xexp_copy, game + "/default.xexp", error);
+}
+
+/* ---- The install ------------------------------------------------------------------- */
+
+int install(const std::string &job)
+{
+    const std::string staging_rel = field(job, "staging"), image_rel = field(job, "image"),
+                      update_rel = field(job, "update"), update_kind = field(job, "update_kind"),
+                      disc_root = field(job, "disc_root"), update_root = field(job, "update_root"),
+                      update_xexp = field(job, "update_xexp");
+    const std::uint64_t needed = std::strtoull(field(job, "needed").c_str(), nullptr, 10);
+    const bool with_update = update_kind == "package";
+
+    /* Only inside the app's folder, and only its staging folder is emptied. */
+    const bool plain = staging_rel == kStagingRel && recomp::zip::safe_name(image_rel) &&
+                       (disc_root.empty() || recomp::zip::safe_name(disc_root)) &&
+                       (update_kind == "none" || (with_update && recomp::zip::safe_name(update_rel) &&
+                                                  (update_root.empty() || recomp::zip::safe_name(update_root)) &&
+                                                  recomp::zip::safe_name(update_xexp)));
+    if (!plain)
+        return fail("The install job is damaged. Start the install again.");
+    const std::string staging = g_app + "/" + staging_rel, game = staging + "/game";
+    const std::string image = g_app + "/" + image_rel, update = with_update ? g_app + "/" + update_rel : std::string();
+    drive_of(g_app);
+    log_line("started (pid %d): %s, %s, into %s (%s, %s free)", int(getpid()), image_rel.c_str(),
+             with_update ? update_rel.c_str() : "no title update",
+             staging.c_str(), g.drive.c_str(), mb(g.free).c_str());
+
+    /* What's copied: the disc's files (from the disc image, or a folder they were copied
+     * out to)... */
+    set_phase("reading", 1);
+    const bool folder = field(job, "image_kind") == "folder";
+    recomp::Disc disc;
+    std::string error;
+    std::vector<DiscItem> items;
+    std::vector<FolderItem> folder_items;
+    std::set<std::string> names;
+    std::uint64_t total = 0;
+    bool xex = false;
+    if (folder)
+    {
+        if (!list_folder(disc_root.empty() ? image : image + "/" + disc_root, folder_items, error))
+            return fail(error);
+        for (const FolderItem &f : folder_items)
+        {
+            if (!recomp::zip::safe_name(f.rel) || !names.insert(lower(f.rel)).second)
+                return fail("The game folder has a file the installer can't write: " + f.rel + ".");
+            total += f.size;
+            xex = xex || lower(f.rel) == "default.xex";
+        }
+    }
+    else
+    {
+        if (!disc.open(image, error))
+            return fail(error);
+        for (const recomp::DiscFile &f : disc.files())
+        {
+            std::string rel;
+            if (f.is_dir || !under(f.path, disc_root, rel))
+                continue;
+            if (!recomp::zip::safe_name(rel) || !names.insert(lower(rel)).second)
+                return fail("The disc image has a file the installer can't write: " + f.path + ".");
+            items.push_back({&f, rel});
+            total += f.size;
+            xex = xex || lower(rel) == "default.xex";
+        }
+        std::sort(items.begin(), items.end(),
+                  [](const DiscItem &a, const DiscItem &b) { return a.file->sector < b.file->sector; });
+    }
+    if (!xex)
+        return fail("This disc image has no default.xex where the app found it. Check the disc image again.");
+    /* ...and the title update's */
+    recomp::stfs::Package pkg;
+    if (with_update)
+    {
+        if (!pkg.open(update, error))
+            return fail("the title update: " + error);
+        std::uint64_t xexp_size = 0;
+        for (const recomp::stfs::Entry &e : pkg.entries())
+        {
+            std::string rel;
+            if (!under(e.name, update_root, rel))
+                continue;
+            total += e.size;
+            if (lower(e.name) == lower(update_xexp))
+                xexp_size = e.size;
+        }
+        if (!xexp_size)
+            return fail("The title update has no default.xexp.");
+        total += xexp_size;
+    }
+    g.copy_total = total;
+
+    /* An empty staging folder (an earlier try's files go), marked as this job's, and room
+     * for the install */
+    if (g_cancel.load())
+        return fail("Stopped.");
+    set_phase("clearing", 1);
+    {
+        std::uint64_t removed = 0;
+        std::string error;
+        if (!remove_tree(staging, removed, error))
+            return fail("The files of an earlier install couldn't be removed (" + error + ").");
+        if (removed)
+            log_line("removed an earlier install's %llu files and folders", (unsigned long long)removed);
+    }
+    recomp::zip::make_dirs(game);
+    {
+        const std::string mark = staging + "/.token";
+        const int fd = ::open(mark.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        const bool ok = fd >= 0 && write_all(fd, reinterpret_cast<const std::uint8_t *>(g.token.data()), g.token.size());
+        if (fd >= 0)
+            ::close(fd);
+        if (!ok)
+            return fail("Couldn't write in the app's folder. Is the drive full?");
+    }
+    drive_of(g_app);
+    if (needed && g.free && g.free < needed)
+        return fail("There isn't enough free space. The install needs about " + mb(needed) + " and the drive has " +
+                        mb(g.free) + " free.",
+                    staging);
+
+    /* 1. Copying */
+    const double t1 = now_s();
+    set_phase("copying", 1);
+    log_line("copying %zu files from the %s, %s", folder ? folder_items.size() : items.size(),
+             folder ? "game folder" : "disc image", mb(total).c_str());
+    if (folder)
+    {
+        for (const FolderItem &f : folder_items)
+        {
+            const std::string dst = game + "/" + f.rel;
+            recomp::zip::make_dirs(dst.substr(0, dst.find_last_of('/')));
+            if (!copy_file(f.from, dst, error))
+                return fail(error, staging);
+        }
+    }
+    else if (!copy_disc(disc, items, game, error))
+        return fail(error, staging);
+    disc.close();
+    if (with_update && !copy_package(pkg, update_root, update_xexp, game, error))
+        return fail(error, staging);
+    pkg.close();
+    const double copy_s = now_s() - t1;
+    log_line("copied %s in %.1f s (%.0f MB/s)", mb(g.copy_done).c_str(), copy_s,
+             copy_s > 0 ? double(g.copy_done) / 1048576.0 / copy_s : 0.0);
+    if (g_cancel.load())
+        return fail("Stopped.", staging);
+
+    /* On the drive, then done */
+    set_phase("syncing", 1);
+    const double t3 = now_s();
+    sync();
+    if (g_cancel.load())
+        return fail("Stopped.", staging);
+    {
+        std::lock_guard<std::mutex> l(g.m);
+        g.phase = "done";
+    }
+    write_status();
+    log_line("done in %.0f s (flushing %.1f s)", now_s() - g.t0, now_s() - t3);
+    return 0;
+}
+/* ---- A content package ---------------------------------------------------------------
+ *     kind=package
+ *     staging=UserData/mp3/.install-staging
+ *     source=install/<the package, or a folder of its files>
+ *     source_kind=package|folder
+ *     root=<the folder in it to copy; empty: the top>
+ *     target=<where in the staging folder: dlc/<package name>, update>
+ *     needed=<bytes the install needs free>
+ * Its files go into <staging>/<target>; the app checks them and moves them into place. */
+int package(const std::string &job)
+{
+    const std::string staging_rel = field(job, "staging"), source_rel = field(job, "source"),
+                      source_kind = field(job, "source_kind"), root = field(job, "root"), name = field(job, "target");
+    const std::uint64_t needed = std::strtoull(field(job, "needed").c_str(), nullptr, 10);
+    const bool plain = staging_rel == kStagingRel && recomp::zip::safe_name(source_rel) &&
+                       (root.empty() || recomp::zip::safe_name(root)) && recomp::zip::safe_name(name) &&
+                       (source_kind == "package" || source_kind == "folder");
+    if (!plain)
+        return fail("The install job is damaged. Start the install again.");
+    const std::string staging = g_app + "/" + staging_rel, target = staging + "/" + name;
+    const std::string source = g_app + "/" + source_rel;
+    drive_of(g_app);
+    log_line("started (pid %d): %s from %s, into %s (%s, %s free)", int(getpid()), name.c_str(),
+             source_rel.c_str(), target.c_str(), g.drive.c_str(), mb(g.free).c_str());
+
+    set_phase("reading", 1);
+    std::string error;
+    recomp::stfs::Package pkg;
+    std::vector<FolderItem> folder_items;
+    std::uint64_t total = 0;
+    if (source_kind == "package")
+    {
+        if (!pkg.open(source, error))
+            return fail("The package: " + error);
+        for (const recomp::stfs::Entry &e : pkg.entries())
+        {
+            std::string rel;
+            if (under(e.name, root, rel))
+                total += e.size;
+        }
+    }
+    else
+    {
+        if (!list_folder(root.empty() ? source : source + "/" + root, folder_items, error))
+            return fail(error);
+        for (const FolderItem &f : folder_items)
+        {
+            if (!recomp::zip::safe_name(f.rel))
+                return fail("The folder has a file the installer can't write: " + f.rel + ".");
+            total += f.size;
+        }
+    }
+    if (!total)
+        return fail("No files could be found in it. Check the package again.");
+    g.copy_total = total;
+
+    if (g_cancel.load())
+        return fail("Stopped.");
+    set_phase("clearing", 1);
+    {
+        std::uint64_t removed = 0;
+        if (!remove_tree(staging, removed, error))
+            return fail("The files of an earlier install couldn't be removed (" + error + ").");
+        if (removed)
+            log_line("removed an earlier install's %llu files and folders", (unsigned long long)removed);
+    }
+    recomp::zip::make_dirs(target);
+    {
+        const std::string mark = staging + "/.token";
+        const int fd = ::open(mark.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        const bool ok = fd >= 0 && write_all(fd, reinterpret_cast<const std::uint8_t *>(g.token.data()), g.token.size());
+        if (fd >= 0)
+            ::close(fd);
+        if (!ok)
+            return fail("Couldn't write in the app's folder. Is the drive full?");
+    }
+    drive_of(g_app);
+    if (needed && g.free && g.free < needed)
+        return fail("There isn't enough free space. It needs about " + mb(needed) + " and the drive has " +
+                        mb(g.free) + " free.",
+                    staging);
+
+    const double t1 = now_s();
+    set_phase("copying", 1);
+    log_line("copying %s of %s", mb(total).c_str(), name.c_str());
+    if (source_kind == "package")
+    {
+        if (!copy_package_files(pkg, root, target, "The package", name + "/", error))
+            return fail(error, staging);
+        pkg.close();
+    }
+    else
+    {
+        for (const FolderItem &f : folder_items)
+        {
+            const std::string dst = target + "/" + f.rel;
+            recomp::zip::make_dirs(dst.substr(0, dst.find_last_of('/')));
+            if (!copy_file(f.from, dst, error))
+                return fail(error, staging);
+        }
+    }
+    const double copy_s = now_s() - t1;
+    log_line("copied %s in %.1f s (%.0f MB/s)", mb(g.copy_done).c_str(), copy_s,
+             copy_s > 0 ? double(g.copy_done) / 1048576.0 / copy_s : 0.0);
+
+    set_phase("syncing", 1);
+    sync();
+    if (g_cancel.load())
+        return fail("Stopped.", staging);
+    {
+        std::lock_guard<std::mutex> l(g.m);
+        g.phase = "done";
+    }
+    write_status();
+    log_line("done in %.0f s", now_s() - g.t0);
+    return 0;
+}
+/* ---- Max Payne 3's HD textures ---------------------------------------------------------
+ *     kind=textures
+ *     staging=UserData/mp3/.install-staging
+ *     list=hub/mp3-textures.txt                      (the app's list of them)
+ *     files=UserData/mp3/.install-job/texture-files.txt
+ *                                                    ("<source in the list, hex> <path in the app>",
+ *                                                     the copies of each file the app found)
+ *     needed=<bytes the install needs free>
+ * The textures go into <staging>/textures (mp3_textures_core.h); the app moves them into place. */
+int textures(const std::string &job)
+{
+    const std::string staging_rel = field(job, "staging"), list_rel = field(job, "list"),
+                      files_rel = field(job, "files");
+    const std::uint64_t needed = std::strtoull(field(job, "needed").c_str(), nullptr, 10);
+    if (staging_rel != kStagingRel || !recomp::zip::safe_name(list_rel) || !recomp::zip::safe_name(files_rel))
+        return fail("The install job is damaged. Start the install again.");
+    const std::string staging = g_app + "/" + staging_rel, target = staging + "/textures";
+    drive_of(g_app);
+    log_line("started (pid %d): HD textures into %s (%s, %s free)", int(getpid()), target.c_str(), g.drive.c_str(),
+             mb(g.free).c_str());
+
+    set_phase("reading", 1);
+    mp3tex::Manifest m;
+    if (!mp3tex::LoadManifest(g_app + "/" + list_rel, m))
+        return fail("The app's HD texture list couldn't be read.");
+    std::string files;
+    if (!read_text(g_app + "/" + files_rel, files))
+        return fail("The list of the texture pack's files couldn't be read.");
+    {
+        size_t at = 0;
+        while (at < files.size())
+        {
+            size_t end = files.find('\n', at);
+            if (end == std::string::npos)
+                end = files.size();
+            const std::string line = files.substr(at, end - at);
+            at = end + 1;
+            const size_t space = line.find(' ');
+            if (space == std::string::npos)
+                continue;
+            const size_t idx = std::strtoul(line.substr(0, space).c_str(), nullptr, 16);
+            const std::string rel = line.substr(space + 1);
+            if (idx < m.sources.size() && recomp::zip::safe_name(rel))
+                m.sources[idx].found.push_back(g_app + "/" + rel);
+        }
+    }
+    size_t usable = 0;
+    const std::uint64_t total = mp3tex::UsableBytes(m, &usable);
+    if (!usable)
+        return fail("None of the texture pack's files were found.");
+    g.copy_total = total;
+
+    if (g_cancel.load())
+        return fail("Stopped.");
+    set_phase("clearing", 1);
+    std::string error;
+    {
+        std::uint64_t removed = 0;
+        if (!remove_tree(staging, removed, error))
+            return fail("The files of an earlier install couldn't be removed (" + error + ").");
+    }
+    recomp::zip::make_dirs(target);
+    {
+        const std::string mark = staging + "/.token";
+        const int fd = ::open(mark.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        const bool ok = fd >= 0 && write_all(fd, reinterpret_cast<const std::uint8_t *>(g.token.data()), g.token.size());
+        if (fd >= 0)
+            ::close(fd);
+        if (!ok)
+            return fail("Couldn't write in the app's folder. Is the drive full?");
+    }
+    drive_of(g_app);
+    if (needed && g.free && g.free < needed)
+        return fail("There isn't enough free space. It needs about " + mb(needed) + " and the drive has " +
+                        mb(g.free) + " free.",
+                    staging);
+
+    const double t1 = now_s();
+    set_phase("copying", 1);
+    log_line("making %zu HD textures (%s) from %zu files", usable, mb(total).c_str(), m.sources.size());
+    size_t written = 0, bad = 0;
+    if (!mp3tex::Build(m, target, g.copy_done, &g_cancel, written, bad, error))
+        return fail(error, staging);
+    const double copy_s = now_s() - t1;
+    log_line("made %zu HD textures (%zu didn't match the list) in %.1f s (%.0f MB/s)", written, bad, copy_s,
+             copy_s > 0 ? double(g.copy_done) / 1048576.0 / copy_s : 0.0);
+    if (!written)
+        return fail("None of the HD textures could be made: the pack's files aren't the ones the list was made from.",
+                    staging);
+
+    set_phase("syncing", 1);
+    sync();
+    if (g_cancel.load())
+        return fail("Stopped.", staging);
+    {
+        std::lock_guard<std::mutex> l(g.m);
+        g.phase = "done";
+    }
+    write_status();
+    log_line("done in %.0f s", now_s() - g.t0);
+    return 0;
+}
+} // namespace
+
+int main()
+{
+    umask(0);
+    g.t0 = now_s();
+    std::string app;
+    if (!find_app(app))
+        return 1; /* (no job: the app falls back to installing by itself) */
+    g_app = app;
+    g_jobdir = app + "/" + kJobRel;
+    recomp::zip::make_dirs(app + "/logs");
+    g_log = app + "/logs/installer.log";
+    if (size_of(g_log) > (1u << 20))
+        std::rename(g_log.c_str(), (g_log + ".old").c_str());
+    /* One at a time: a lock on "running" (let go when this ends, however it ends); a
+     * second installer leaves the job to the first. */
+    const int lock = ::open((g_jobdir + "/running").c_str(), O_RDWR | O_CREAT, 0666);
+    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0)
+    {
+        log_line("another installer is already working; this one leaves it to that");
+        return 1;
+    }
+    /* The job taken: job.txt becomes job.taken. If it's gone, the app took it back (it
+     * stopped waiting for an installer to start) and installs by itself, or stopped. */
+    std::string job;
+    if (std::rename((g_jobdir + "/job.txt").c_str(), (g_jobdir + "/job.taken").c_str()) != 0 ||
+        !read_text(g_jobdir + "/job.taken", job))
+    {
+        log_line("the app took the job back before this installer started; leaving it");
+        return 0;
+    }
+    g.token = field(job, "token");
+    if (exists(g_jobdir + "/cancel"))
+    {
+        g_cancel = true;
+        return fail("Stopped.");
+    }
+    write_status();
+    std::thread status(status_main);
+    const std::string kind = field(job, "kind");
+    const int rc = kind == "package" ? package(job) : kind == "textures" ? textures(job) : install(job);
+    g_quit = true;
+    status.join();
+    write_status();
+    ::close(lock);
+    return rc;
+}

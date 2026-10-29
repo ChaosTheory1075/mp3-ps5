@@ -1,0 +1,10 @@
+[project]
+name = "mp3"
+sdk_version = "0.9.0"
+
+[entrypoint]
+# Disc 1's default.xex with TU9 (default.xexp) beside it; the loader applies
+# the patch, so the code generated is 0.0.9.6's.
+file_path = "assets/default.xex"
+out_directory_path = "generated"
+includes = ["mp3_config.toml"]

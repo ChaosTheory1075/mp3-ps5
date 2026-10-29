@@ -1,0 +1,117 @@
+# Max Payne 3 (5454086B), TU9 0.0.9.6 - ReXGlue codegen configuration.
+# Register model flags as GTA IV's (same RAGE engine family and compiler era);
+# [rexcrt] and [functions] are filled in as this game's analysis finds them.
+
+skip_lr = false
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = false
+skip_msr = false
+cr_as_local = true
+non_argument_as_local = false
+non_volatile_as_local = true
+volatile_vector_as_local = true
+volatile_as_local = false
+
+[analysis]
+max_jump_extension = 65536
+data_region_threshold = 16
+large_function_threshold = 1048576
+
+[rexcrt]
+
+[functions]
+
+# Tail-call targets codegen could not place in a function (Unresolved b target).
+"0x82204C98" = {}
+"0x8269CE00" = {}
+"0x8292BDD8" = {}
+"0x82A91F40" = {}
+"0x82E51820" = {}
+"0x82E934F0" = {}
+"0x82E93500" = {}
+
+# Entries the analyzer merged into the function before them (each follows a
+# tail call; referenced from data or built with lis/addi). tools/find_missed_entries.py
+"0x82678138" = {}
+"0x8276D9E8" = {}
+"0x82782EC0" = {}
+"0x8279A088" = {}
+"0x8279A4B0" = {}
+"0x827B8AD0" = {}
+"0x827EFC10" = {}
+"0x827FBA38" = {}
+"0x827FC5A8" = {}
+"0x828099A8" = {}
+"0x8280AA60" = {}
+"0x8280AA98" = {}
+"0x8280AAB8" = {}
+"0x8280AAE8" = {}
+"0x8280AB40" = {}
+"0x8280AB80" = {}
+"0x828192F0" = {}
+"0x82819308" = {}
+"0x8281F2B8" = {}
+"0x82CE4E90" = {}
+"0x83019358" = {}
+"0x830202B0" = {}
+"0x830202B8" = {}
+"0x830202C8" = {}
+"0x830255D0" = {}
+"0x830255D8" = {}
+"0x830255E8" = {}
+"0x830255F0" = {}
+"0x830255F8" = {}
+"0x83025600" = {}
+"0x83026988" = {}
+"0x83026998" = {}
+"0x830269A0" = {}
+"0x830269A8" = {}
+"0x830269B0" = {}
+"0x830269B8" = {}
+"0x830269C0" = {}
+"0x830269C8" = {}
+"0x830269D0" = {}
+"0x830269D8" = {}
+"0x83027F38" = {}
+"0x830394C8" = {}
+"0x83039A40" = {}
+"0x83039A50" = {}
+"0x830D0CD8" = {}
+"0x830D0CF8" = {}
+"0x830D0EB0" = {}
+"0x830D0ED0" = {}
+"0x830D0F30" = {}
+"0x830D7040" = {}
+"0x830D7318" = {}
+
+# Entries after a bctr/blr (vtable thunks, virtual-call wrappers).
+"0x82286218" = {}
+"0x82286228" = {}
+"0x82306460" = {}
+"0x824C3528" = {}
+"0x8260EFF0" = {}
+"0x826C4B20" = {}
+"0x82BAC910" = {}
+"0x82BAC920" = {}
+"0x82BAC930" = {}
+"0x82BF4EB0" = {}
+"0x82C2A548" = {}
+"0x82E8FDE8" = {}
+"0x82EA4720" = {}
+"0x82ED9568" = {}
+"0x82ED9578" = {}
+"0x82FBAFB8" = {}
+"0x82FBAFD8" = {}
+"0x82FBAFE8" = {}
+"0x82FBAFF8" = {}
+"0x82FBB008" = {}
+"0x82FD76E0" = {}
+"0x82FD7700" = {}
+"0x83020320" = {}
+"0x83027130" = {}
+"0x8303B2A8" = {}
+"0x830F9B60" = {}
+
+# A virtual-call wrapper whose address is built 15 instructions apart (lis ... addi).
+"0x82FBAFC8" = {}

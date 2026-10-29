@@ -1,0 +1,15 @@
+# Game code and data never go in this repo unencrypted.
+*.xex
+*.xexp
+*.iso
+*.rpf
+mp3-recomp/assets/
+mp3-recomp/generated/
+mp3-asset-key.txt
+build*/
+out/
+fw/
+tools/lzx/*.dll
+rpf-key-*.txt
+__pycache__/
+tools/lzx/*.lib
