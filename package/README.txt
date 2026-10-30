@@ -46,8 +46,9 @@ SAVES     BACK UP SAVES (to install/backups/), SEND LOGS (for a bug report),
           backups.
 SETTINGS  DISC              which disc the game starts on (it asks for disc 2
                             itself when the story gets there).
-          LANGUAGE          English, French, German, Spanish, Italian or
-                            Russian text and subtitles.
+          LANGUAGE          English, French, German, Spanish, Italian,
+                            Brazilian Portuguese, Polish or Russian text and
+                            subtitles.
           FRAME RATE        60 or 30 locked (the Xbox 360's).
           HD TEXTURES       the textures/ folder's HD textures, if installed.
           ANTI-ALIASING     off or FXAA.

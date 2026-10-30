@@ -20,8 +20,8 @@ Max Payne 3 for the Xbox 360.
 - Installs the discs, Title Update 9, the DLC and the HD textures from your own files, at the drive's
   full speed
 - Imports your Xbox 360 saves, backs up and restores saves
-- The game's text and subtitles in English, French, German, Spanish, Italian or Russian
-  (SETTINGS > LANGUAGE)
+- The game's text and subtitles in English, French, German, Spanish, Italian, Brazilian
+  Portuguese, Polish or Russian (SETTINGS > LANGUAGE)
 - A menu with HOME, CONTENT, SAVES, SETTINGS, TROPHIES and CREDITS pages, its own art and music
 - Bug reports from the PS5: SAVES > SEND LOGS uploads the logs with what you type, and a QR code opens
   a GitHub issue here with it all filled in

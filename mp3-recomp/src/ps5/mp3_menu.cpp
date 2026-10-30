@@ -63,7 +63,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // (in the reports SEND LOGS makes)
-constexpr const char* kAppVersion = "1.0.1";
+constexpr const char* kAppVersion = "1.0.2";
 
 ImFont* g_title = nullptr;
 ImFont* g_item = nullptr;
@@ -170,7 +170,8 @@ struct Settings {
     const char* name;
   };
   static constexpr Language kLanguages[] = {
-      {1, "ENGLISH"}, {4, "FRENCH"}, {3, "GERMAN"}, {5, "SPANISH"}, {6, "ITALIAN"}, {12, "RUSSIAN"}};
+      {1, "ENGLISH"}, {4, "FRENCH"}, {3, "GERMAN"}, {5, "SPANISH"}, {6, "ITALIAN"},
+      {9, "PORTUGUESE (BR)"}, {11, "POLISH"}, {12, "RUSSIAN"}};  // (Portuguese and Polish: Title Update 9's)
   static int LanguageIndex(int id) {
     for (int i = 0; i < int(std::size(kLanguages)); ++i)
       if (kLanguages[i].id == id) return i;
@@ -567,7 +568,7 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
     lines[kLanguage] = {"GAME", "LANGUAGE", Settings::kLanguages[Settings::LanguageIndex(settings_.language)].name,
                         true,
                         "The language of the game's text, menus and subtitles: English, French, German, Spanish, "
-                        "Italian or Russian. The voices stay in English, as on the Xbox 360."};
+                        "Italian, Brazilian Portuguese, Polish or Russian. The voices stay in English, as on the Xbox 360."};
     lines[kFrameRate] = {"GRAPHICS", "FRAME RATE", settings_.fps == 30 ? "30 (LOCKED)" : "60", true,
                          "30 locks the game to the Xbox 360's own rate: steady, as Max Payne 3 was made. 60 lets it "
                          "run faster, up to the TV's 60 frames a second, when the PS5 keeps up; the busiest fights "
