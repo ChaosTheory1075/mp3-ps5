@@ -30,6 +30,7 @@
 #include "imgui.h"
 #include "mp3_install.h"
 #include "mp3_trophies.h"
+#include "qrcodegen/qrcodegen.hpp"
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -61,6 +62,9 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// (in the reports SEND LOGS makes)
+constexpr const char* kAppVersion = "1.0.1";
+
 ImFont* g_title = nullptr;
 ImFont* g_item = nullptr;
 ImFont* g_body = nullptr;
@@ -73,12 +77,15 @@ std::vector<std::unique_ptr<rex::ui::ImmediateTexture>>* g_textures =
 // ---- the pad ----
 
 enum : uint32_t {
-  kUp = 1, kDown = 2, kLeft = 4, kRight = 8, kCross = 16, kCircle = 32, kL1 = 64, kR1 = 128, kTriangle = 256
+  kUp = 1, kDown = 2, kLeft = 4, kRight = 8, kCross = 16, kCircle = 32, kL1 = 64, kR1 = 128, kTriangle = 256,
+  kSquare = 512, kOptions = 1024, kL2 = 2048, kR2 = 4096
 };
 
 constexpr uint32_t kPadUp = 0x00000010u, kPadRight = 0x00000020u, kPadDown = 0x00000040u,
                    kPadLeft = 0x00000080u, kPadL1 = 0x00000400u, kPadR1 = 0x00000800u,
-                   kPadTriangle = 0x00001000u, kPadCircle = 0x00002000u, kPadCross = 0x00004000u;
+                   kPadTriangle = 0x00001000u, kPadCircle = 0x00002000u, kPadCross = 0x00004000u,
+                   kPadSquare = 0x00008000u, kPadOptions = 0x00000008u, kPadL2 = 0x00000100u,
+                   kPadR2 = 0x00000200u;
 struct PadData {
   uint32_t buttons;
   uint8_t lx, ly, rx, ry, l2, r2;
@@ -113,6 +120,10 @@ class Pad {
     if (d.buttons & kPadTriangle) b |= kTriangle;
     if (d.buttons & kPadL1) b |= kL1;
     if (d.buttons & kPadR1) b |= kR1;
+    if (d.buttons & kPadSquare) b |= kSquare;
+    if (d.buttons & kPadOptions) b |= kOptions;
+    if (d.buttons & kPadL2) b |= kL2;
+    if (d.buttons & kPadR2) b |= kR2;
     uint32_t pressed = b & ~last_;
     const auto now = std::chrono::steady_clock::now();
     constexpr uint32_t kDirs = kUp | kDown | kLeft | kRight;
@@ -150,8 +161,21 @@ struct Settings {
   int filter = 3;     // anisotropic_override 2..5: 2x, 4x, 8x, 16x
   bool lane = true;   // the GPU's second lane (crackdown_gpu_lane)
   int music = 60;     // the menu song's level, 0..100
+  int language = 1;   // the Xbox 360's language ID (user_language): kLanguages
 
   static constexpr const char* kFilterNames[] = {"", "", "2X", "4X", "8X", "16X"};
+  // The disc's languages (the World release: En, Fr, De, Es, It, Ru), by their Xbox 360 IDs.
+  struct Language {
+    int id;
+    const char* name;
+  };
+  static constexpr Language kLanguages[] = {
+      {1, "ENGLISH"}, {4, "FRENCH"}, {3, "GERMAN"}, {5, "SPANISH"}, {6, "ITALIAN"}, {12, "RUSSIAN"}};
+  static int LanguageIndex(int id) {
+    for (int i = 0; i < int(std::size(kLanguages)); ++i)
+      if (kLanguages[i].id == id) return i;
+    return 0;
+  }
 
   static Settings Load(const fs::path& app) {
     Settings s;
@@ -169,6 +193,7 @@ struct Settings {
         if (k == "texture_filtering") s.filter = std::clamp(value, 2, 5);
         if (k == "gpu_lane") s.lane = value != 0;
         if (k == "menu_music") s.music = std::clamp(value, 0, 100);
+        if (k == "language") s.language = kLanguages[LanguageIndex(value)].id;
       }
       std::fclose(f);
     }
@@ -182,8 +207,10 @@ struct Settings {
 
   void Save(const fs::path& app) const {
     if (std::FILE* f = std::fopen((app / "menu.ini").string().c_str(), "wb")) {
-      std::fprintf(f, "frame_rate = %d\nhd_textures = %d\nfxaa = %d\ntexture_filtering = %d\ngpu_lane = %d\nmenu_music = %d\n",
-                   fps, hd_textures ? 1 : 0, fxaa ? 1 : 0, filter, lane ? 1 : 0, music);
+      std::fprintf(f,
+                   "frame_rate = %d\nhd_textures = %d\nfxaa = %d\ntexture_filtering = %d\ngpu_lane = %d\nmenu_music = %d\n"
+                   "language = %d\n",
+                   fps, hd_textures ? 1 : 0, fxaa ? 1 : 0, filter, lane ? 1 : 0, music, language);
       std::fclose(f);
     }
     if (std::FILE* f = std::fopen((app / "disc.txt").string().c_str(), "wb")) {
@@ -205,10 +232,12 @@ struct Settings {
     rex::cvar::SetFlagByName("swap_post_effect", fxaa ? "fxaa" : "none");
     rex::cvar::SetFlagByName("anisotropic_override", std::to_string(filter));
     rex::cvar::SetFlagByName("crackdown_gpu_lane", lane ? "true" : "false");
+    // (the game's text, menus and subtitles follow XGetLanguage: ci/patch_framework.py)
+    rex::cvar::SetFlagByName("user_language", std::to_string(language));
     REXLOG_INFO("Max Payne 3 menu: disc {}, frame rate {}, HD textures {}, anti-aliasing {}, texture filtering {}, "
-                "the GPU's second lane {}",
+                "the GPU's second lane {}, language {}",
                 disc, fps == 30 ? "30 (locked)" : "60", hd_textures ? "on" : "off", fxaa ? "FXAA" : "off",
-                kFilterNames[filter], lane ? "on" : "off");
+                kFilterNames[filter], lane ? "on" : "off", kLanguages[LanguageIndex(language)].name);
   }
 };
 
@@ -266,7 +295,10 @@ const char* const kPageNames[kPages] = {"HOME", "CONTENT", "SAVES", "SETTINGS", 
 
 // The settings page's rows, in its order (a new option: a row here, its line
 // in SettingsLines and its change in ChangeSetting).
-enum SettingsRow { kDisc, kFrameRate, kTextures, kAntiAliasing, kFiltering, kLane, kMusic, kSettingsRows };
+// The saves page's rows: its two actions, then the saves and backups in install/.
+enum SavesRow { kBackupRow, kSendLogsRow, kSavesFirst };
+
+enum SettingsRow { kDisc, kLanguage, kFrameRate, kTextures, kAntiAliasing, kFiltering, kLane, kMusic, kSettingsRows };
 
 class MenuDialog final : public rex::ui::ImGuiDialog {
  public:
@@ -436,6 +468,10 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
       if (p & kCircle) install::TheJob().KeepLeftovers(app_), ask_leftovers_ = false, Refresh();
       return;
     }
+    if (reporting_) {
+      HandleReport(p);  // (the keyboard has the pad to itself)
+      return;
+    }
     if (p & (kL1 | kR1)) {
       page_ = Page((page_ + ((p & kR1) ? 1 : kPages - 1)) % kPages);
       page_in_ = 0;
@@ -472,16 +508,18 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
         break;
       }
       case kSaves: {
-        const int rows = 1 + int(SaveSources().size());
+        const int rows = kSavesFirst + int(SaveSources().size());
         if (p & kUp) saves_row_ = (saves_row_ + rows - 1) % rows;
         if (p & kDown) saves_row_ = (saves_row_ + 1) % rows;
         saves_row_ = std::min(saves_row_, rows - 1);
         auto& job = install::TheJob();
         if (job.Busy() || !(p & kCross)) break;
-        if (saves_row_ == 0) {
+        if (saves_row_ == kBackupRow) {
           job.Backup(app_);
+        } else if (saves_row_ == kSendLogsRow) {
+          reporting_ = true;  // (what went wrong typed first: HandleReport)
         } else if (Confirmed(200 + saves_row_)) {
-          job.Install(app_, *SaveSources()[size_t(saves_row_ - 1)]);
+          job.Install(app_, *SaveSources()[size_t(saves_row_ - kSavesFirst)]);
         }
         break;
       }
@@ -526,6 +564,10 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
                     has_disc2_ ? "Which of the Xbox 360's two discs the game starts on. The game asks for disc 2 on "
                                  "its own when the story gets there, and the app starts again on it."
                                : "Disc 2's files aren't in the app's game2/ folder: the game runs from disc 1."};
+    lines[kLanguage] = {"GAME", "LANGUAGE", Settings::kLanguages[Settings::LanguageIndex(settings_.language)].name,
+                        true,
+                        "The language of the game's text, menus and subtitles: English, French, German, Spanish, "
+                        "Italian or Russian. The voices stay in English, as on the Xbox 360."};
     lines[kFrameRate] = {"GRAPHICS", "FRAME RATE", settings_.fps == 30 ? "30 (LOCKED)" : "60", true,
                          "30 locks the game to the Xbox 360's own rate: steady, as Max Payne 3 was made. 60 lets it "
                          "run faster, up to the TV's 60 frames a second, when the PS5 keeps up; the busiest fights "
@@ -556,6 +598,12 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
       case kDisc:
         if (flip && has_disc2_) settings_.disc = settings_.disc == 1 ? 2 : 1;
         break;
+      case kLanguage: {
+        const int n = int(std::size(Settings::kLanguages));
+        const int i = (Settings::LanguageIndex(settings_.language) + (step ? step : cross ? 1 : 0) + n) % n;
+        settings_.language = Settings::kLanguages[i].id;
+        break;
+      }
       case kFrameRate:
         if (flip) settings_.fps = settings_.fps == 30 ? 60 : 30;
         break;
@@ -705,6 +753,180 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
     }
     DrawFooter(dl, size);
     if (ask_leftovers_) DrawLeftoversQuestion(dl, size);
+    if (reporting_) DrawReport(dl, size);
+  }
+
+  // ---- SEND LOGS: what went wrong, typed with the pad, and the GitHub issue's QR code ----
+
+  // The keyboard: four rows of keys, then SPACE, DELETE and SEND.
+  static constexpr const char* kKeys[4] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL'", "ZXCVBNM,.?"};
+  static constexpr int kKeyRows = 5, kKeyCols = 10;
+  static constexpr size_t kNoteMax = 300;  // (the QR code stays easy to scan off a TV)
+  // the bottom row's three keys, by column
+  static int BottomKey(int col) { return col < 5 ? 0 : col < 8 ? 1 : 2; }  // SPACE, DELETE, SEND
+
+  void TypeKey(char c) {
+    if (note_.size() >= kNoteMax) return;
+    note_ += (c >= 'A' && c <= 'Z' && !caps_) ? char(c - 'A' + 'a') : c;
+  }
+
+  void HandleReport(uint32_t p) {
+    if (p & kCircle) {
+      reporting_ = false;
+      return;
+    }
+    if (p & kUp) key_row_ = (key_row_ + kKeyRows - 1) % kKeyRows;
+    if (p & kDown) key_row_ = (key_row_ + 1) % kKeyRows;
+    if (p & kLeft) key_col_ = (key_col_ + kKeyCols - 1) % kKeyCols;
+    if (p & kRight) key_col_ = (key_col_ + 1) % kKeyCols;
+    if (p & kL1) caps_ = !caps_;
+    if (p & kSquare) {
+      if (!note_.empty()) note_.pop_back();
+    }
+    if (p & kTriangle) TypeKey(' ');
+    bool send = (p & (kOptions | kR2)) != 0;
+    if (p & kCross) {
+      if (key_row_ < 4) {
+        TypeKey(kKeys[key_row_][key_col_]);
+      } else {
+        switch (BottomKey(key_col_)) {
+          case 0: TypeKey(' '); break;
+          case 1: if (!note_.empty()) note_.pop_back(); break;
+          default: send = true; break;
+        }
+      }
+    }
+    if (send && !install::TheJob().Busy()) {
+      sent_note_ = note_;
+      sent_settings_ = SettingsSummary();
+      reporting_ = false;
+      install::TheJob().SendLogs(app_, note_);
+    }
+  }
+
+  // The settings, for the report ("60 FPS, HD textures on, ...").
+  std::string SettingsSummary() const {
+    std::string s = settings_.fps == 30 ? "30 FPS (locked)" : "60 FPS";
+    s += std::string(", HD textures ") + (has_textures_ ? (settings_.hd_textures ? "on" : "off") : "not installed");
+    s += std::string(", anti-aliasing ") + (settings_.fxaa ? "FXAA" : "off");
+    s += std::string(", filtering ") + Settings::kFilterNames[settings_.filter];
+    s += std::string(", GPU helper ") + (settings_.lane ? "on" : "off");
+    s += std::string(", language ") + Settings::kLanguages[Settings::LanguageIndex(settings_.language)].name;
+    s += std::string(", disc ") + (settings_.disc == 2 ? "2" : "1");
+    return s;
+  }
+
+  static std::string UrlEncode(const std::string& in) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : in) {
+      if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+        out += char(c);
+      } else {
+        out += '%';
+        out += hex[c >> 4];
+        out += hex[c & 15];
+      }
+    }
+    return out;
+  }
+
+  // A new issue on the project's GitHub, filled in with the report, the logs' link and the settings.
+  std::string IssueUrl(const std::string& link) const {
+    std::string title = "Report from the PS5";
+    if (!sent_note_.empty()) title += ": " + sent_note_.substr(0, 60) + (sent_note_.size() > 60 ? "..." : "");
+    std::string body = "**What happened**\n" + (sent_note_.empty() ? std::string("(not typed in)") : sent_note_) +
+                       "\n\n**Logs:** https://" + link + "\n**Version:** " + kAppVersion +
+                       "\n**Settings:** " + sent_settings_ + "\n\n(Sent from the app's SAVES > SEND LOGS.)\n";
+    return std::string("https://github.com/ChaosTheory1075/mp3-ps5/issues/new?title=") + UrlEncode(title) +
+           "&body=" + UrlEncode(body);
+  }
+
+  // The QR code for the latest link (made once per link).
+  void UpdateQr(const std::string& link) {
+    if (link == qr_link_) return;
+    qr_link_ = link;
+    qr_.clear();
+    qr_size_ = 0;
+    if (link.empty()) return;
+    try {
+      const auto qr = qrcodegen::QrCode::encodeText(IssueUrl(link).c_str(), qrcodegen::QrCode::Ecc::LOW);
+      qr_size_ = qr.getSize();
+      qr_.resize(size_t(qr_size_) * size_t(qr_size_));
+      for (int y = 0; y < qr_size_; ++y)
+        for (int x = 0; x < qr_size_; ++x) qr_[size_t(y) * size_t(qr_size_) + size_t(x)] = qr.getModule(x, y);
+    } catch (const std::exception& e) {
+      REXLOG_WARN("Max Payne 3 menu: no QR code for the report ({})", e.what());
+      qr_.clear();
+      qr_size_ = 0;
+    }
+  }
+
+  // The QR code, `side` wide with its white margin, at (x, y).
+  void DrawQr(ImDrawList* dl, float x, float y, float side) {
+    if (!qr_size_) return;
+    const int border = 3;
+    const float m = std::max(1.0f, std::floor(side / float(qr_size_ + border * 2)));
+    const float full = m * float(qr_size_ + border * 2);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + full, y + full), P(IM_COL32(255, 255, 255, 255)));
+    for (int row = 0; row < qr_size_; ++row) {
+      for (int col = 0; col < qr_size_; ++col) {
+        if (!qr_[size_t(row) * size_t(qr_size_) + size_t(col)]) continue;
+        const float px = x + float(col + border) * m, py = y + float(row + border) * m;
+        dl->AddRectFilled(ImVec2(px, py), ImVec2(px + m, py + m), P(IM_COL32(0, 0, 0, 255)));
+      }
+    }
+  }
+
+  // "What went wrong?": the text so far and the keyboard, over the page.
+  void DrawReport(ImDrawList* dl, const ImVec2& size) {
+    const float u = u_;
+    dl->AddRectFilled(ImVec2(0, 0), size, A(IM_COL32(0, 0, 0, 190)));
+    const float w = 1300 * u, h = 860 * u, x = (size.x - w) * 0.5f, y = (size.y - h) * 0.5f;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), A(IM_COL32(14, 12, 12, 250)), 10 * u);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 8 * u, y + h), A(kRed));
+    const float l = x + 50 * u;
+    dl->AddText(g_item, 44 * u, ImVec2(l, y + 36 * u), A(kWhite), "SEND LOGS");
+    dl->AddText(g_body, 26 * u, ImVec2(l, y + 96 * u), A(kText),
+                "Say what went wrong (or leave it empty), then SEND. The logs go to catbox.moe, and a QR code "
+                "opens a GitHub issue with your words and the logs' link filled in. Anyone with the link can read "
+                "the logs.",
+                nullptr, w - 100 * u);
+    // the text so far, with a cursor
+    const float ty = y + 200 * u, tw = w - 100 * u;
+    dl->AddRectFilled(ImVec2(l, ty), ImVec2(l + tw, ty + 150 * u), A(IM_COL32(30, 28, 28, 255)), 6 * u);
+    std::string shown = note_ + ((int(time_ * 2) % 2) ? "_" : " ");
+    dl->AddText(g_body, 28 * u, ImVec2(l + 16 * u, ty + 12 * u), A(kWhite), shown.c_str(), nullptr, tw - 32 * u);
+    char count[32];
+    std::snprintf(count, sizeof(count), "%zu / %zu", note_.size(), kNoteMax);
+    dl->AddText(g_body, 20 * u, ImVec2(l + tw - Width(g_body, 20 * u, count), ty + 158 * u), A(kDim), count);
+    // the keys
+    const float ky = ty + 200 * u, kw = tw / kKeyCols, kh = 64 * u;
+    for (int r = 0; r < 4; ++r) {
+      for (int c = 0; c < kKeyCols; ++c) {
+        const bool sel = r == key_row_ && c == key_col_;
+        const float kx = l + c * kw, yy = ky + r * (kh + 8 * u);
+        dl->AddRectFilled(ImVec2(kx + 3 * u, yy), ImVec2(kx + kw - 3 * u, yy + kh),
+                          A(sel ? kRed : IM_COL32(40, 38, 38, 255)), 5 * u);
+        char key[2] = {kKeys[r][c], 0};
+        if (key[0] >= 'A' && key[0] <= 'Z' && !caps_) key[0] = char(key[0] - 'A' + 'a');
+        dl->AddText(g_body, 32 * u, ImVec2(kx + (kw - Width(g_body, 32 * u, key)) * 0.5f, yy + 14 * u),
+                    A(kWhite), key);
+      }
+    }
+    const char* bottom[3] = {"SPACE", "DELETE", "SEND"};
+    const int span[3][2] = {{0, 5}, {5, 8}, {8, 10}};
+    const float by = ky + 4 * (kh + 8 * u);
+    for (int k = 0; k < 3; ++k) {
+      const bool sel = key_row_ == 4 && BottomKey(key_col_) == k;
+      const float x0 = l + span[k][0] * kw, x1 = l + span[k][1] * kw;
+      dl->AddRectFilled(ImVec2(x0 + 3 * u, by), ImVec2(x1 - 3 * u, by + kh),
+                        A(sel ? kRed : k == 2 ? IM_COL32(70, 20, 22, 255) : IM_COL32(40, 38, 38, 255)), 5 * u);
+      dl->AddText(g_item, 30 * u, ImVec2((x0 + x1 - Width(g_item, 30 * u, bottom[k])) * 0.5f, by + 16 * u),
+                  A(kWhite), bottom[k]);
+    }
+    dl->AddText(g_body, 22 * u, ImVec2(l, y + h - 50 * u), A(kGrey),
+                "X  TYPE      SQUARE  DELETE      TRIANGLE  SPACE      L1  CAPS      OPTIONS  SEND      O  CANCEL");
   }
 
   // "The installs are done: delete the files they came from?" over the page.
@@ -998,7 +1220,7 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
     dl->AddText(g_body, 22 * u, ImVec2(left, y), P(kRed), count);
     y += 48 * u;
     const auto saves = SaveSources();
-    const int rows = 1 + int(saves.size());
+    const int rows = kSavesFirst + int(saves.size());
     // (an imported save's file deleted after the install: the list shorter under the selected row)
     saves_row_ = std::min(saves_row_, rows - 1);
     for (int r = 0; r < rows; ++r) {
@@ -1006,15 +1228,28 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
       const float fs = 36 * u;
       if (sel) dl->AddRectFilled(ImVec2(left - 30 * u, y + 6 * u), ImVec2(left - 20 * u, y + fs), P(kRed));
       std::string label;
-      if (r == 0) {
+      if (r == kBackupRow) {
         label = "BACK UP SAVES";
+      } else if (r == kSendLogsRow) {
+        label = "SEND LOGS";
       } else {
-        const install::Source* s = saves[size_t(r - 1)];
+        const install::Source* s = saves[size_t(r - kSavesFirst)];
         label = (s->kind == install::Kind::kBackup ? "RESTORE  " : "IMPORT  ") + Short(s->label, 40);
         if (sel && Confirming(200 + r)) label = "PRESS X AGAIN TO CONFIRM";
       }
       dl->AddText(g_item, fs, ImVec2(left, y), P(sel ? kWhite : kGrey), label.c_str());
       y += fs + 22 * u;
+      // (the link the logs went to, kept on screen to be copied down)
+      if (r == kSendLogsRow) {
+        const std::string link = install::TheJob().LogsLink();
+        if (!link.empty()) {
+          // (in the body font: the link has small letters, and they count)
+          dl->AddText(g_body, 30 * u, ImVec2(left, y - 12 * u), P(kRed), "LINK  ");
+          dl->AddText(g_body, 30 * u, ImVec2(left + Width(g_body, 30 * u, "LINK  "), y - 12 * u), P(kWhite),
+                      link.c_str());
+          y += 40 * u;
+        }
+      }
     }
     y += 10 * u;
     y = DrawJob(dl, left, y, 820 * u) + 10 * u;
@@ -1033,10 +1268,15 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
       }
     }
     const char* help =
-        saves_row_ == 0
+        saves_row_ == kBackupRow
             ? "Copies your saves, your trophies and your settings to PPSA95454/install/backups/. Copy that folder "
               "to a PC or a USB drive before deleting or reinstalling the app."
-        : saves[size_t(saves_row_ - 1)]->kind == install::Kind::kBackup
+        : saves_row_ == kSendLogsRow
+            ? "For a bug report: type what went wrong, and the app's logs (PPSA95454/logs/, the last few runs) "
+              "go to catbox.moe. A link and a QR code come back: the QR code opens a GitHub issue with it all "
+              "filled in. Anyone with the link can read the logs; they say how the game ran, not who you are. "
+              "Needs the internet and a payload loader (etaHEN or elfldr)."
+        : saves[size_t(saves_row_ - kSavesFirst)]->kind == install::Kind::kBackup
             ? "Puts this backup's saves, trophies and settings back, over the ones here."
             : "Imports this Xbox 360 save (a package copied off a 360, with a USB drive or Horizon) into the app. "
               "A save of the same name here is replaced.";
@@ -1047,6 +1287,19 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
     const std::string text = std::string(help) + (saves.empty() ? where : "");
     const float px = 1180 * u + page_dx_, pw = size.x - 140 * u - px;
     dl->AddRectFilled(ImVec2(px - 40 * u, 200 * u), ImVec2(px - 39 * u, 760 * u), P(IM_COL32(255, 255, 255, 40)));
+    // the logs sent: the QR code of the GitHub issue in place of the help
+    const std::string link = install::TheJob().LogsLink();
+    UpdateQr(link);
+    if (saves_row_ == kSendLogsRow && qr_size_) {
+      dl->AddText(g_item, 34 * u, ImVec2(px, 204 * u), P(kWhite), "SCAN TO REPORT IT");
+      dl->AddText(g_body, 24 * u, ImVec2(px, 252 * u), P(kText),
+                  "With your phone's camera: a GitHub issue opens with what you typed, the logs' link and your "
+                  "settings filled in. Press Submit (a GitHub account is needed). Or send the link above with "
+                  "your report.",
+                  nullptr, pw);
+      DrawQr(dl, px, 380 * u, std::min(pw, 560 * u));
+      return;
+    }
     dl->AddText(g_body, 26 * u, ImVec2(px, 204 * u), P(kText), text.c_str(), nullptr, pw);
   }
 
@@ -1319,6 +1572,13 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
   float result_t_ = -100, confirm_t_ = -100, missing_flash_ = 0;
   bool ask_leftovers_ = false;
   uint64_t leftover_bytes_ = 0;
+  // SEND LOGS: the report being typed (the keyboard over the page), what was sent with the logs,
+  // and the QR code of the GitHub issue for the link they went to
+  bool reporting_ = false, caps_ = true;
+  int key_row_ = 1, key_col_ = 0;
+  std::string note_, sent_note_, sent_settings_, qr_link_;
+  std::vector<uint8_t> qr_;  // (modules, row by row; 0 when it didn't fit)
+  int qr_size_ = 0;
   Page page_ = kHome;
   int row_ = kFrameRate, trophy_ = 0;
   trophies::List trophies_;

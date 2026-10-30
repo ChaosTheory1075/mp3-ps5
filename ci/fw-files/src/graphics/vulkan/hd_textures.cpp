@@ -9,7 +9,7 @@
  * instead; the guest image is still loaded as always, so nothing else in the
  * cache changes. When the guest memory changes, the reload hashes again.
  *
- * The DDS files are read on a thread of their own: until one is in, the
+ * The DDS files are read on two threads of their own: until one is in, the
  * texture draws as the guest's, and the binding is refreshed when it arrives
  * (reading them on the GPU thread held up frames whenever new ones came in).
  *
@@ -98,7 +98,6 @@ struct HdReplacer {
   std::vector<uint64_t> requests;
   std::vector<std::pair<uint64_t, HdDds>> done;
   std::unordered_set<uint64_t> pending;  // (GPU thread only)
-  std::thread reader;
   // report counters: loads seen, not replaceable (by reason), hashed, matched
   uint64_t seen = 0, skip_kind = 0, skip_swizzle = 0, skip_size = 0, skip_dynamic = 0, hashed = 0, matched = 0,
            misses_logged = 0;
@@ -239,8 +238,8 @@ HdReplacer* VulkanTextureCache::Hd() const {
     delete hd;
     return nullptr;
   }
-  hd->reader = std::thread(HdReaderMain, hd);
-  hd->reader.detach();
+  // (two readers: entering a new area asks for hundreds at once)
+  for (int i = 0; i < 2; ++i) std::thread(HdReaderMain, hd).detach();
   hd_ = hd;
   hd_disabled_ = false;
   return hd_;
@@ -310,9 +309,10 @@ void VulkanTextureCache::HdPoll() {
   {
     std::lock_guard<std::mutex> lock(hd->mutex);
     if (hd->done.empty()) return;
-    // (a few at a time, so a burst of new ones doesn't hold up a frame)
+    // (a few at a time, so a burst of new ones doesn't hold up a frame: copying
+    // 48 MB into staging took most of a 60 FPS frame, 16 MB is a few ms)
     size_t n = 0, bytes = 0;
-    while (n < hd->done.size() && n < 16 && bytes < (48u << 20)) bytes += hd->done[n++].second.data.size();
+    while (n < hd->done.size() && n < 8 && bytes < (16u << 20)) bytes += hd->done[n++].second.data.size();
     done.assign(std::make_move_iterator(hd->done.begin()), std::make_move_iterator(hd->done.begin() + n));
     hd->done.erase(hd->done.begin(), hd->done.begin() + n);
   }

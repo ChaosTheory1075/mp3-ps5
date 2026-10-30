@@ -69,6 +69,34 @@ def main():
          "u32 XamSwapDisc_entry(u32 disc_number) {\n"
          "  REXKRNL_INFO(\"XamSwapDisc({})\", (uint32_t)disc_number);\n"
          "  if (rex_app_swap_disc) rex_app_swap_disc(disc_number);\n")
+    # The game's file reads, in the log (the telemetry was only printed on
+    # Android): every 10 s while it reads, how much and how long a read took,
+    # for reports of slow loading.
+    xio = sdk / "src" / "kernel" / "xboxkrnl" / "xboxkrnl_io.cpp"
+    edit(xio,
+         "  if (now - last > 2000000000ll && t.last_report_ns.compare_exchange_strong(last, now)) {\n",
+         "  if (now - last > 10000000000ll && t.last_report_ns.compare_exchange_strong(last, now)) {\n")
+    edit(xio,
+         "                        (long long)peak);\n#endif\n",
+         "                        (long long)peak);\n#endif\n"
+         "    if (last) {  // [mp3]\n"
+         "      const double secs = double(now - last) / 1e9;\n"
+         "      REXKRNL_INFO(\"mp3 io: {:.0f} reads/s ({} async), {:.1f} MB/s, {:.0f} KB a read, {:.2f} ms a read, \"\n"
+         "                   \"{} at once at most\",\n"
+         "                   reads / secs, async_reads, total / 1e6 / secs, reads ? total / 1024.0 / reads : 0.0,\n"
+         "                   reads ? service / 1e6 / reads : 0.0, peak);\n"
+         "    }\n")
+    # XGetLanguage returned English whatever user_language said (the Xbox 360's
+    # console language, which the game's text and trophies follow): the
+    # menu's LANGUAGE setting sets it (mp3_menu.cpp).
+    edit(xam_info,
+         "#include <rex/system/kernel_state.h>\n",
+         "#include <rex/system/flags.h>\n#include <rex/system/kernel_state.h>\n")
+    edit(xam_info,
+         "u32 XGetLanguage_entry() {\n",
+         "u32 XGetLanguage_entry() {\n"
+         "  if (const uint32_t language = REXCVAR_GET(user_language); language >= 1 && language <= 12)\n"
+         "    return language;\n")
 
     # HD texture replacement in the Vulkan texture cache (ci/fw-files/
     # src/graphics/vulkan/hd_textures.cpp): its members, and three hooks.
@@ -1071,6 +1099,118 @@ def main():
          "      if ((++mp3_writes % 50) == 1 || mp3_written != 1)\n"
          "        REXGPU_INFO(\"mp3: pipeline storage: {} written this session ({} failed)\", mp3_writes, mp3_failed);\n"
          "    }\n")
+
+    # The stored shaders were translated one at a time on the GPU thread, before
+    # the game's main thread is even resumed (rex_app.cpp: blocking): the wait
+    # after PLAY grew with every shader the player had met. Now on several
+    # threads, each with a translator of its own and a shader's modifications
+    # on one thread, as the D3D12 cache does; the shader modules and binding
+    # layouts after, on this thread (TranslateAnalyzedShader skips the
+    # translator for a translation that's done).
+    edit(vpc2, "#include <array>\n", "#include <array>\n#include <chrono>\n")
+    edit(vpc2,
+         "  if (!translator.TranslateAnalyzedShader(translation)) {\n",
+         "  if (translation.is_translated() ? !translation.is_valid()\n"
+         "                                  : !translator.TranslateAnalyzedShader(translation)) {\n")
+    edit(vpc2,
+         "  // Translate shader modifications needed for stored pipelines.\n"
+         "  for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {\n"
+         "    auto shader_it = shaders_.find(translation_needed.first);\n"
+         "    if (shader_it == shaders_.end()) {\n"
+         "      continue;\n"
+         "    }\n"
+         "    auto* shader = shader_it->second;\n"
+         "    if (!shader->is_ucode_analyzed()) {\n"
+         "      shader->AnalyzeUcode(ucode_disasm_buffer_);\n"
+         "    }\n"
+         "    bool translation_is_new = false;\n"
+         "    auto* translation = static_cast<VulkanShader::VulkanTranslation*>(\n"
+         "        shader->GetOrCreateTranslation(translation_needed.second, &translation_is_new));\n"
+         "    if (!translation->is_translated() &&\n"
+         "        !TranslateAnalyzedShader(*shader_translator_, *translation)) {\n"
+         "      if (translation_is_new) {\n"
+         "        shader->DestroyTranslation(translation_needed.second);\n"
+         "      }\n"
+         "    }\n"
+         "  }\n",
+         "  // Translate shader modifications needed for stored pipelines.\n"
+         "  // [mp3] on several threads (ci/patch_framework.py)\n"
+         "  {\n"
+         "    const auto mp3_start = std::chrono::steady_clock::now();\n"
+         "    struct Mp3Translation {\n"
+         "      VulkanShader* shader;\n"
+         "      uint64_t modification;\n"
+         "      VulkanShader::VulkanTranslation* translation;\n"
+         "      bool is_new;\n"
+         "    };\n"
+         "    std::vector<Mp3Translation> mp3_jobs;  // (a shader's together: the set's order)\n"
+         "    for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {\n"
+         "      auto shader_it = shaders_.find(translation_needed.first);\n"
+         "      if (shader_it == shaders_.end()) {\n"
+         "        continue;\n"
+         "      }\n"
+         "      auto* shader = shader_it->second;\n"
+         "      if (!shader->is_ucode_analyzed()) {\n"
+         "        shader->AnalyzeUcode(ucode_disasm_buffer_);\n"
+         "      }\n"
+         "      bool translation_is_new = false;\n"
+         "      auto* translation = static_cast<VulkanShader::VulkanTranslation*>(\n"
+         "          shader->GetOrCreateTranslation(translation_needed.second, &translation_is_new));\n"
+         "      if (!translation->is_translated()) {\n"
+         "        mp3_jobs.push_back({shader, translation_needed.second, translation, translation_is_new});\n"
+         "      }\n"
+         "    }\n"
+         "    std::vector<size_t> mp3_groups;  // (where each shader's start, and the end)\n"
+         "    for (size_t i = 0; i < mp3_jobs.size(); ++i) {\n"
+         "      if (!i || mp3_jobs[i].shader != mp3_jobs[i - 1].shader) mp3_groups.push_back(i);\n"
+         "    }\n"
+         "    mp3_groups.push_back(mp3_jobs.size());\n"
+         "    std::atomic<size_t> mp3_next_group(0);\n"
+         "    auto mp3_translate = [&](SpirvShaderTranslator& translator) {\n"
+         "      for (size_t g; (g = mp3_next_group.fetch_add(1)) + 1 < mp3_groups.size();) {\n"
+         "        for (size_t i = mp3_groups[g]; i < mp3_groups[g + 1]; ++i) {\n"
+         "          translator.TranslateAnalyzedShader(*mp3_jobs[i].translation);\n"
+         "        }\n"
+         "      }\n"
+         "    };\n"
+         "    const uint32_t mp3_cpus = std::max(rex::thread::logical_processor_count(), uint32_t(2));\n"
+         "    const size_t mp3_threads =\n"
+         "        std::min<size_t>(std::min<uint32_t>(mp3_cpus - 1, 8), mp3_groups.size() - 1);\n"
+         "    if (mp3_threads > 1) {\n"
+         "      const ui::vulkan::VulkanDevice* const mp3_device = command_processor_.GetVulkanDevice();\n"
+         "      const bool mp3_fsi =\n"
+         "          render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;\n"
+         "      std::vector<std::unique_ptr<SpirvShaderTranslator>> mp3_translators;\n"
+         "      std::vector<std::unique_ptr<rex::thread::Thread>> mp3_workers;\n"
+         "      for (size_t i = 1; i < mp3_threads; ++i) {\n"
+         "        mp3_translators.push_back(std::make_unique<SpirvShaderTranslator>(\n"
+         "            SpirvShaderTranslator::Features(mp3_device),\n"
+         "            render_target_cache_.msaa_2x_attachments_supported(),\n"
+         "            render_target_cache_.msaa_2x_no_attachments_supported(), mp3_fsi,\n"
+         "            render_target_cache_.draw_resolution_scale_x(),\n"
+         "            render_target_cache_.draw_resolution_scale_y()));\n"
+         "        SpirvShaderTranslator* translator = mp3_translators.back().get();\n"
+         "        mp3_workers.push_back(\n"
+         "            rex::thread::Thread::Create({}, [&mp3_translate, translator]() { mp3_translate(*translator); }));\n"
+         "        mp3_workers.back()->set_name(\"Vulkan Shader Translation\");\n"
+         "      }\n"
+         "      mp3_translate(*shader_translator_);\n"
+         "      for (const auto& worker : mp3_workers) rex::thread::Wait(worker.get(), false);\n"
+         "    } else {\n"
+         "      mp3_translate(*shader_translator_);\n"
+         "    }\n"
+         "    for (const Mp3Translation& job : mp3_jobs) {\n"
+         "      if (!TranslateAnalyzedShader(*shader_translator_, *job.translation) && job.is_new) {\n"
+         "        job.shader->DestroyTranslation(job.modification);\n"
+         "      }\n"
+         "    }\n"
+         "    REXGPU_INFO(\"mp3: shader storage: {} shader translations for the stored pipelines in {} ms ({} threads)\",\n"
+         "                mp3_jobs.size(),\n"
+         "                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -\n"
+         "                                                                      mp3_start)\n"
+         "                    .count(),\n"
+         "                std::max<size_t>(mp3_threads, 1));\n"
+         "  }\n")
 
     # The storage files stay open all session, and the PS5 ends the game
     # without closing them: what they gained never reached the drive

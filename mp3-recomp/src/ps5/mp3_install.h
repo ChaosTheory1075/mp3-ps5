@@ -96,6 +96,14 @@ class Job {
   bool Install(const fs::path& app, const Source& source);
   bool Uninstall(const fs::path& app, Remove what);
   bool Backup(const fs::path& app);
+  // <app>/logs uploaded for a bug report (by the installer payload), `note` (what went wrong, one
+  // line) at their top; the result has the link.
+  bool SendLogs(const fs::path& app, const std::string& note);
+  // The link the last sending of the logs gave ("" none yet), without https://.
+  std::string LogsLink() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return logs_link_;
+  }
 
   // What the installs took from install/ (disc images, title update and DLC packages): kept there
   // until the user says to delete them (DeleteLeftovers) or to keep them (KeepLeftovers: noted in
@@ -113,7 +121,7 @@ class Job {
   std::atomic<uint32_t> generation_{0};
   std::atomic<uint64_t> done_{0}, total_{0};
   mutable std::mutex mutex_;
-  std::string title_, result_;
+  std::string title_, result_, logs_link_;
   std::vector<fs::path> leftovers_;
 
  public:

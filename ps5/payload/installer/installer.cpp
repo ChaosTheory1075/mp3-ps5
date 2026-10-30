@@ -53,6 +53,9 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include <zlib.h>
+#if MP3_LOGS
+#include <curl/curl.h> /* (sending the logs: the SDK's homebrew libcurl) */
+#endif
 #include "mp3_textures_core.h" /* Max Payne 3's HD textures from the Nexus pack (the app's, copied in) */
 
 #include <algorithm>
@@ -221,7 +224,7 @@ bool write_all(int fd, const std::uint8_t *data, std::size_t n)
 struct Status
 {
     std::mutex m; /* the strings and the step */
-    std::string token, phase = "starting", error, drive;
+    std::string token, phase = "starting", error, drive, result; /* (result: the logs' link) */
     int step = 0;
     std::uint64_t free = 0, unpack_guess = 0, beat = 0;
     std::atomic<std::uint64_t> copy_done{0}, copy_total{0}, unpack_done{0}, unpack_total{0};
@@ -264,7 +267,7 @@ void write_status()
                       (unsigned long long)s.write_ns.load(), (unsigned long long)g.free, (unsigned long long)++g.beat);
         text = buf;
         text += "file=" + one_line(file) + "\nfolder=" + one_line(g_app) + "\ndrive=" + one_line(g.drive) +
-                "\nerror=" + one_line(g.error) + "\n";
+                "\nerror=" + one_line(g.error) + "\nresult=" + one_line(g.result) + "\n";
     }
     const std::string tmp = g_jobdir + "/status.tmp", fin = g_jobdir + "/status.txt";
     static bool failing = false; /* (logged once each time it starts failing) */
@@ -1351,6 +1354,160 @@ int textures(const std::string &job)
     log_line("done in %.0f s", now_s() - g.t0);
     return 0;
 }
+
+#if MP3_LOGS
+/* ---- The logs, sent for a bug report -----------------------------------------------
+ *     kind=logs
+ * The newest files in <app>/logs (each run's mp3_*.log and its parts, crash.log, installer.log),
+ * up to 48 MB of them, newest first, put together in one text gzipped and uploaded to catbox.moe
+ * (anonymous, no account): status.txt's result= is the link. Here and not in the app because a
+ * title can't look up a host name (ps5platform's getaddrinfo refuses); a payload can. */
+std::size_t keep_reply(char *data, std::size_t size, std::size_t n, void *out)
+{
+    static_cast<std::string *>(out)->append(data, size * n);
+    return size * n;
+}
+
+int sent_so_far(void *, curl_off_t, curl_off_t, curl_off_t total, curl_off_t now)
+{
+    if (total > 0)
+        g.copy_total = std::uint64_t(total), g.copy_done = std::uint64_t(now);
+    return g_cancel.load() ? 1 : 0; /* (non-zero stops the upload) */
+}
+
+int logs(const std::string &job)
+{
+    const std::string dir = g_app + "/logs";
+    log_line("started (pid %d): sending the logs in %s", int(getpid()), dir.c_str());
+    set_phase("reading", 1);
+    struct File
+    {
+        std::string name;
+        std::uint64_t size;
+        std::time_t modified;
+    };
+    std::vector<File> files;
+    if (DIR *d = opendir(dir.c_str()))
+    {
+        while (dirent *e = readdir(d))
+        {
+            const std::string name = e->d_name;
+            const bool text = name.size() > 4 && (name.compare(name.size() - 4, 4, ".log") == 0 ||
+                                                  name.compare(name.size() - 4, 4, ".txt") == 0 ||
+                                                  name.compare(name.size() - 4, 4, ".old") == 0);
+            struct stat st{};
+            if (text && ::stat((dir + "/" + name).c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+                files.push_back({name, std::uint64_t(st.st_size), st.st_mtime});
+        }
+        closedir(d);
+    }
+    if (files.empty())
+        return fail("There are no logs to send yet. Play the game once, then send them.");
+    std::sort(files.begin(), files.end(), [](const File &a, const File &b) { return a.modified > b.modified; });
+
+    constexpr std::uint64_t kMax = 48ull << 20;
+    std::string text = "Max Payne 3 RePrescribed logs\n";
+    if (const std::string note = field(job, "note"); !note.empty())
+        text += "What went wrong: " + note + "\n";
+    std::uint64_t taken = 0;
+    for (const File &f : files)
+    {
+        if (taken >= kMax)
+            break;
+        std::string content;
+        if (!read_text(dir + "/" + f.name, content))
+            continue;
+        if (content.size() > kMax - taken) /* (the end of a long one: what led up to its last moments) */
+            content.erase(0, content.size() - (kMax - taken));
+        char when[32] = "?";
+        std::tm tm{};
+        if (localtime_r(&f.modified, &tm))
+            std::strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
+        text += "\n===== " + f.name + " (" + std::to_string(f.size) + " bytes, written " + when + ") =====\n";
+        text += content;
+        taken += content.size();
+    }
+
+    set_phase("packing", 1);
+    std::string packed(compressBound(uLong(text.size())) + 64, '\0');
+    z_stream z{};
+    if (deflateInit2(&z, 6, Z_DEFLATED, 15 + 16 /* gzip */, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        return fail("The logs couldn't be packed.");
+    z.next_in = reinterpret_cast<Bytef *>(text.data());
+    z.avail_in = uInt(text.size());
+    z.next_out = reinterpret_cast<Bytef *>(packed.data());
+    z.avail_out = uInt(packed.size());
+    const int zrc = deflate(&z, Z_FINISH);
+    packed.resize(z.total_out);
+    deflateEnd(&z);
+    if (zrc != Z_STREAM_END)
+        return fail("The logs couldn't be packed.");
+    log_line("%zu log files, %s, packed into %s", files.size(), mb(text.size()).c_str(), mb(packed.size()).c_str());
+
+    set_phase("uploading", 1);
+    char name[64];
+    {
+        const std::time_t t = std::time(nullptr);
+        std::tm tm{};
+        localtime_r(&t, &tm);
+        std::strftime(name, sizeof name, "mp3-logs-%Y%m%d-%H%M%S.txt.gz", &tm);
+    }
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURL *curl = curl_easy_init();
+    if (!curl)
+        return fail("The upload couldn't start.");
+    curl_mime *form = curl_mime_init(curl);
+    curl_mimepart *part = curl_mime_addpart(form);
+    curl_mime_name(part, "reqtype");
+    curl_mime_data(part, "fileupload", CURL_ZERO_TERMINATED);
+    part = curl_mime_addpart(form);
+    curl_mime_name(part, "fileToUpload");
+    curl_mime_data(part, packed.data(), packed.size());
+    curl_mime_filename(part, name);
+    curl_mime_type(part, "application/gzip");
+    std::string reply;
+    curl_easy_setopt(curl, CURLOPT_URL, "https://catbox.moe/user/api.php");
+    curl_easy_setopt(curl, CURLOPT_MIMEPOST, form);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "MaxPayne3RePrescribed-PS5/1.0");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, keep_reply);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &reply);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, sent_so_far);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    /* The console has no certificate store for a payload: the connection is encrypted but the
+     * server isn't checked. (What goes is only the logs, which the user chose to make public.) */
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    const CURLcode rc = curl_easy_perform(curl);
+    long http = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
+    curl_easy_cleanup(curl);
+    curl_mime_free(form);
+    while (!reply.empty() && std::isspace(static_cast<unsigned char>(reply.back())))
+        reply.pop_back();
+    if (rc != CURLE_OK)
+    {
+        log_line("upload failed: %s", curl_easy_strerror(rc));
+        return fail(std::string("The upload failed (") + curl_easy_strerror(rc) +
+                    "). Is the PS5 connected to the internet?");
+    }
+    if (http != 200 || reply.compare(0, 8, "https://") != 0)
+    {
+        log_line("upload refused: HTTP %ld, %s", http, reply.substr(0, 200).c_str());
+        return fail("The upload site didn't take the logs (HTTP " + std::to_string(http) + "). Try again later.");
+    }
+    log_line("logs sent: %s", reply.c_str());
+    {
+        std::lock_guard<std::mutex> l(g.m);
+        g.result = reply;
+        g.phase = "done";
+    }
+    write_status();
+    return 0;
+}
+#endif
 } // namespace
 
 int main()
@@ -1392,7 +1549,14 @@ int main()
     write_status();
     std::thread status(status_main);
     const std::string kind = field(job, "kind");
-    const int rc = kind == "package" ? package(job) : kind == "textures" ? textures(job) : install(job);
+    const int rc = kind == "package"    ? package(job)
+                   : kind == "textures" ? textures(job)
+#if MP3_LOGS
+                   : kind == "logs"     ? logs(job)
+#else
+                   : kind == "logs"     ? fail("This payload doesn't send logs (that's mp3-ps5-logs.elf).")
+#endif
+                                        : install(job);
     g_quit = true;
     status.join();
     write_status();

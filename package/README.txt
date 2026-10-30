@@ -41,10 +41,13 @@ The menu
 HOME      PLAY; an install's progress; what's missing and where it goes.
 CONTENT   disc 1, disc 2, Title Update 9, the DLC and the HD textures: installed or not,
           X installs one from install/, triangle (twice) uninstalls it.
-SAVES     BACK UP SAVES (to install/backups/), IMPORT an Xbox 360 save
-          package from install/, RESTORE one of the backups.
+SAVES     BACK UP SAVES (to install/backups/), SEND LOGS (for a bug report),
+          IMPORT an Xbox 360 save package from install/, RESTORE one of the
+          backups.
 SETTINGS  DISC              which disc the game starts on (it asks for disc 2
                             itself when the story gets there).
+          LANGUAGE          English, French, German, Spanish, Italian or
+                            Russian text and subtitles.
           FRAME RATE        60 or 30 locked (the Xbox 360's).
           HD TEXTURES       the textures/ folder's HD textures, if installed.
           ANTI-ALIASING     off or FXAA.
@@ -71,7 +74,7 @@ first play-through can stutter now and then; later sessions load them.
 
 Updating to a new build
 -----------------------
-Replace eboot.bin, sce_sys/ and sce_module/ (and hub/ if it changed). Keep
+Replace eboot.bin, sce_sys/, sce_module/ and payloads/ (and hub/ if it changed). Keep
 game/, game2/, dlc/, textures/, install/, saves/, UserData/ and menu.ini.
 
 Problems
@@ -82,8 +85,10 @@ Problems
 - Something draws wrong: SETTINGS > GPU HELPER off.
 - The home screen tile, background or music didn't change after an update:
   restart the PS5 (it caches them).
-- A log of every run is written to PPSA95454/logs/. Send the newest one with
-  any report.
+- A log of every run is written to PPSA95454/logs/. For a report, SAVES >
+  SEND LOGS uploads the last few to catbox.moe and shows a link: send that
+  link with the report (anyone with it can read them). Without the internet
+  or a payload loader, copy the newest log off the PS5 by FTP instead.
 
 Credits
 -------

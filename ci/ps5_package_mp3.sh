@@ -94,7 +94,7 @@ cat > "$app/sce_sys/param.json" <<EOF
   "conceptId": "${title_id:4}",
   "contentBadgeType": 1,
   "contentId": "UP9000-${title_id}_00-MAXPAYNE3PS50000",
-  "contentVersion": "01.000.000",
+  "contentVersion": "01.001.000",
   "downloadDataSize": 256,
   "gameIntent": { "permittedIntents": [ { "intentType": "launchActivity" } ] },
   "localizedParameters": {
@@ -127,6 +127,8 @@ cp "$here/../mp3-recomp/src/ps5/mp3_textures_core.h" "$payload_build/include/"  
 make -C "$payload_build" PS5_PAYLOAD_SDK="$sdk_root"
 mkdir -p "$app/payloads"
 cp "$payload_build/mp3-ps5-installer.elf" "$app/payloads/mp3-ps5-installer.elf"
+# (and SEND LOGS's: the same program with the logs' upload, libcurl, in it)
+cp "$payload_build/mp3-ps5-logs.elf" "$app/payloads/mp3-ps5-logs.elf"
 
 "$tool" self --inspect --file "$app/eboot.bin" | tail -3
 echo "==> $app ($(stat -c %s "$app/eboot.bin") bytes)"
