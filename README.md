@@ -15,6 +15,11 @@ Max Payne 3 for the Xbox 360.
 - 60 FPS (the Xbox 360's 30 FPS lock lifted), with a 30 FPS mode
 - The PC version's HD textures, made on the PS5 from the Nexus Mods texture pack
 - FXAA and anisotropic filtering (2x to 16x)
+- PlayStation button icons (the PS3 version's, which the Xbox 360 disc carries too)
+- DualSense features: the light bar follows Max's health (hits, painkillers, bullet time), adaptive
+  triggers for aiming and each shot, and added rumble
+- Skip any cutscene (as Fusion Fix does on the PC) and skip the intro logo
+- An FPS counter (simple or detailed)
 - Both discs, and the DLC
 - The game's achievements as PS5-style trophies, with their own page in the menu
 - Installs the discs, Title Update 9, the DLC and the HD textures from your own files, at the drive's
@@ -98,6 +103,8 @@ carries, `package/mp3-textures.txt`), `xenos_disasm.py` and `xenos_emu.py` (Xbox
   it grew from
 - **Crackdown: ReActivated** (ChaosTheory1075): the sister port whose menu, installer and trophies
   this one shares
+- **ThirteenAG**: [MaxPayne3.FusionFix](https://github.com/ThirteenAG/MaxPayne3.FusionFix), whose
+  cutscene skip this port's follows
 - **mdsxxx1**: [Max Payne 3 Texture Pack V4](https://www.nexusmods.com/maxpayne3/mods/275) on Nexus Mods,
   the HD textures (with **ElPicoleto**'s blood effects and textures from ambientCG). Not included
   here: you download it from the mod's page, and the app builds the textures from it on your PS5

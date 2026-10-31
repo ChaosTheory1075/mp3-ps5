@@ -837,6 +837,7 @@ def main():
          "    }\n"
          "  }\n"
          "#endif\n"
+         "  rex::frame_stats::NotePresent();  // [mp3] the frame rate counter (mp3_overlay.cpp)\n"
          "  rex::mp3_perf::Scope mp3_perf_swap(rex::mp3_perf::kSwap);\n")
 
     # Startup: the shader storage's pipelines were all created before the
@@ -901,6 +902,197 @@ def main():
          "    }\n"
          "    if (found_pipeline == VK_NULL_HANDLE) {\n"
          "      PipelineCreationArguments creation_arguments;\n")
+    # [mp3] Every submission's end built the whole creation queue on the GPU thread
+    # (CreateQueuedPipelinesOnProcessorThread) and then waited for the creation threads'
+    # pipelines in flight, so the async path above stalled the frame anyway: with an empty
+    # cache (a new install) every new area's burst of pipelines froze the picture. Found in
+    # PROTOTYPE: ReEvolution (100-650 ms, all in "submit"). With async compilation the queue
+    # is left to the creation threads.
+    edit(vpc2,
+         "    if (startup_loading) {\n"
+         "      creation_request_cond_.notify_one();\n"
+         "    } else {\n",
+         "    if (startup_loading || REXCVAR_GET(async_shader_compilation)) {  // [mp3]\n"
+         "      creation_request_cond_.notify_one();\n"
+         "    } else {\n")
+    # [mp3] The DualSense light bar in the game's own colour (mp3_game_overlay.cpp: health,
+    # hits, painkillers, bullet time) instead of GTA IV's episode colours and police lights.
+    sfh = sdk / "include" / "rex" / "input" / "sony_feedback.h"
+    sfc = sdk / "src" / "input" / "sony_feedback.cpp"
+    edit(sfh,
+         "  uint32_t context_identity = 0;\n};\n",
+         "  uint32_t context_identity = 0;\n"
+         "  bool has_color = false;  // [mp3] the light bar's colour, from the game\n"
+         "  std::array<uint8_t, 3> color{};\n};\n")
+    edit(sfc,
+         "  if (slot.game.wanted > 0 && now_ms >= slot.wanted_started_ms) {\n",
+         "  if (slot.game.has_color) {  // [mp3]\n"
+         "    output.color = slot.game.color;\n"
+         "  } else if (slot.game.wanted > 0 && now_ms >= slot.wanted_started_ms) {\n")
+    # [mp3] A shader met for the first time was translated (Xenos microcode to SPIR-V) on the
+    # GPU thread in the middle of its draw: about 25 ms each with the EDRAM emulated (612 in
+    # 1924 ms on 8 threads at startup), so a new area's ten or so new shaders held one frame
+    # 100-300 ms (mp3_015.log: every hitch of a fresh-cache run in "draws", none in submit
+    # after the change above). Now worker threads translate them; the draw is skipped until
+    # its shaders are in, as a draw waiting for its pipeline is, and the GPU thread does only
+    # what it owns (the shader module and the binding layouts) once a translation is done.
+    # A shader's translations go to one worker at a time (as at startup).
+    vpch = sdk / "include" / "rex" / "graphics" / "vulkan" / "pipeline_cache.h"
+    edit(vpch,
+         "  bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,\n"
+         "                               VulkanShader::VulkanTranslation* pixel_shader);\n",
+         "  bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,\n"
+         "                               VulkanShader::VulkanTranslation* pixel_shader);\n"
+         "  // [mp3] true while either is being translated on a worker (queued if new): skip the draw\n"
+         "  bool Mp3TranslationPending(VulkanShader::VulkanTranslation* vertex_shader,\n"
+         "                             VulkanShader::VulkanTranslation* pixel_shader);\n")
+    edit(vpch,
+         "  std::unique_ptr<SpirvShaderTranslator> shader_translator_;\n",
+         "  std::unique_ptr<SpirvShaderTranslator> shader_translator_;\n"
+         "  // [mp3] Shader translation on worker threads (Mp3TranslationPending).\n"
+         "  void Mp3TranslationThread(SpirvShaderTranslator* translator);\n"
+         "  void Mp3StopTranslationThreads();\n"
+         "  std::mutex mp3_translation_lock_;\n"
+         "  std::condition_variable mp3_translation_cond_;\n"
+         "  std::deque<VulkanShader::VulkanTranslation*> mp3_translation_queue_;\n"
+         "  std::vector<VulkanShader::VulkanTranslation*> mp3_translation_done_;\n"
+         "  std::set<const void*> mp3_translation_busy_shaders_;\n"
+         "  bool mp3_translation_shutdown_ = false;\n"
+         "  // (the processor thread's own)\n"
+         "  std::set<VulkanShader::VulkanTranslation*> mp3_translation_in_flight_;\n"
+         "  std::vector<std::unique_ptr<SpirvShaderTranslator>> mp3_translation_translators_;\n"
+         "  std::vector<std::unique_ptr<rex::thread::Thread>> mp3_translation_threads_;\n")
+    edit(vpc2,
+         "#include <rex/ui/vulkan/util.h>\n"
+         "\n"
+         "REXCVAR_DEFINE_INT32(\n"
+         "    vulkan_pipeline_creation_threads,",
+         "#include <rex/ui/vulkan/util.h>\n"
+         "\n"
+         "REXCVAR_DEFINE_INT32(mp3_shader_translation_threads, 2, \"GPU/Vulkan\",\n"
+         "                     \"Threads translating new shaders while their draws wait (0: on the GPU thread, \"\n"
+         "                     \"in the draw)\")\n"
+         "    .range(0, 8);\n"
+         "\n"
+         "REXCVAR_DEFINE_INT32(\n"
+         "    vulkan_pipeline_creation_threads,")
+    edit(vpc2,
+         "void VulkanPipelineCache::Shutdown() {\n",
+         "void VulkanPipelineCache::Mp3TranslationThread(SpirvShaderTranslator* translator) {\n"
+         "  for (;;) {\n"
+         "    VulkanShader::VulkanTranslation* job = nullptr;\n"
+         "    {\n"
+         "      std::unique_lock<std::mutex> lock(mp3_translation_lock_);\n"
+         "      for (;;) {\n"
+         "        if (mp3_translation_shutdown_) return;\n"
+         "        auto it = std::find_if(mp3_translation_queue_.begin(), mp3_translation_queue_.end(),\n"
+         "                               [this](VulkanShader::VulkanTranslation* t) {\n"
+         "                                 return !mp3_translation_busy_shaders_.count(&t->shader());\n"
+         "                               });\n"
+         "        if (it != mp3_translation_queue_.end()) {\n"
+         "          job = *it;\n"
+         "          mp3_translation_queue_.erase(it);\n"
+         "          mp3_translation_busy_shaders_.insert(&job->shader());\n"
+         "          break;\n"
+         "        }\n"
+         "        mp3_translation_cond_.wait(lock);\n"
+         "      }\n"
+         "    }\n"
+         "    translator->TranslateAnalyzedShader(*job);\n"
+         "    {\n"
+         "      std::lock_guard<std::mutex> lock(mp3_translation_lock_);\n"
+         "      mp3_translation_busy_shaders_.erase(&job->shader());\n"
+         "      mp3_translation_done_.push_back(job);\n"
+         "    }\n"
+         "    mp3_translation_cond_.notify_all();\n"
+         "  }\n"
+         "}\n"
+         "\n"
+         "void VulkanPipelineCache::Mp3StopTranslationThreads() {\n"
+         "  {\n"
+         "    std::lock_guard<std::mutex> lock(mp3_translation_lock_);\n"
+         "    mp3_translation_shutdown_ = true;\n"
+         "  }\n"
+         "  mp3_translation_cond_.notify_all();\n"
+         "  for (const auto& thread : mp3_translation_threads_) rex::thread::Wait(thread.get(), false);\n"
+         "  mp3_translation_threads_.clear();\n"
+         "  mp3_translation_translators_.clear();\n"
+         "  mp3_translation_queue_.clear();\n"
+         "  mp3_translation_done_.clear();\n"
+         "  mp3_translation_busy_shaders_.clear();\n"
+         "  mp3_translation_in_flight_.clear();\n"
+         "}\n"
+         "\n"
+         "bool VulkanPipelineCache::Mp3TranslationPending(VulkanShader::VulkanTranslation* vertex_shader,\n"
+         "                                                VulkanShader::VulkanTranslation* pixel_shader) {\n"
+         "  const int32_t threads = REXCVAR_GET(mp3_shader_translation_threads);\n"
+         "  if (threads <= 0 || mp3_translation_shutdown_) return false;\n"
+         "  if (mp3_translation_threads_.empty()) {\n"
+         "    const ui::vulkan::VulkanDevice* const device = command_processor_.GetVulkanDevice();\n"
+         "    const bool fsi = render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;\n"
+         "    for (int32_t i = 0; i < threads; ++i) {\n"
+         "      mp3_translation_translators_.push_back(std::make_unique<SpirvShaderTranslator>(\n"
+         "          SpirvShaderTranslator::Features(device), render_target_cache_.msaa_2x_attachments_supported(),\n"
+         "          render_target_cache_.msaa_2x_no_attachments_supported(), fsi,\n"
+         "          render_target_cache_.draw_resolution_scale_x(), render_target_cache_.draw_resolution_scale_y()));\n"
+         "      SpirvShaderTranslator* translator = mp3_translation_translators_.back().get();\n"
+         "      mp3_translation_threads_.push_back(\n"
+         "          rex::thread::Thread::Create({}, [this, translator]() { Mp3TranslationThread(translator); }));\n"
+         "      mp3_translation_threads_.back()->set_name(\"Vulkan Shader Translation\");\n"
+         "    }\n"
+         "    REXGPU_INFO(\"mp3: new shaders translated on {} threads while their draws wait\", threads);\n"
+         "  }\n"
+         "  if (!mp3_translation_in_flight_.empty()) {\n"
+         "    std::vector<VulkanShader::VulkanTranslation*> done;\n"
+         "    {\n"
+         "      std::lock_guard<std::mutex> lock(mp3_translation_lock_);\n"
+         "      done.swap(mp3_translation_done_);\n"
+         "    }\n"
+         "    for (VulkanShader::VulkanTranslation* translation : done) {\n"
+         "      mp3_translation_in_flight_.erase(translation);\n"
+         "      // (translated already: its module and binding layouts, here on the processor thread)\n"
+         "      TranslateAnalyzedShader(*shader_translator_, *translation);\n"
+         "    }\n"
+         "  }\n"
+         "  bool pending = false;\n"
+         "  for (VulkanShader::VulkanTranslation* translation : {vertex_shader, pixel_shader}) {\n"
+         "    if (!translation) continue;\n"
+         "    if (mp3_translation_in_flight_.count(translation)) {\n"
+         "      pending = true;\n"
+         "      continue;\n"
+         "    }\n"
+         "    if (translation->is_translated()) continue;\n"
+         "    if (!translation->shader().is_ucode_analyzed()) {\n"
+         "      translation->shader().AnalyzeUcode(ucode_disasm_buffer_);\n"
+         "    }\n"
+         "    mp3_translation_in_flight_.insert(translation);\n"
+         "    {\n"
+         "      std::lock_guard<std::mutex> lock(mp3_translation_lock_);\n"
+         "      mp3_translation_queue_.push_back(translation);\n"
+         "    }\n"
+         "    mp3_translation_cond_.notify_one();\n"
+         "    pending = true;\n"
+         "  }\n"
+         "  return pending;\n"
+         "}\n"
+         "\n"
+         "void VulkanPipelineCache::Shutdown() {\n"
+         "  Mp3StopTranslationThreads();  // [mp3]\n")
+    edit(vcp,
+         "    if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,\n"
+         "                                                  pixel_shader_translation)) {\n"
+         "      return draw_fail(\"shader_translation\");\n"
+         "    }\n",
+         "    // [mp3] a new shader is translated on a worker: the draw waits, as for its pipeline\n"
+         "    if (pipeline_cache_->Mp3TranslationPending(vertex_shader_translation, pixel_shader_translation)) {\n"
+         "      frame_used_async_placeholder_pipeline_ = true;\n"
+         "      ++frame_flow_draw_placeholders_;\n"
+         "      return true;\n"
+         "    }\n"
+         "    if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,\n"
+         "                                                  pixel_shader_translation)) {\n"
+         "      return draw_fail(\"shader_translation\");\n"
+         "    }\n")
     # [mp3] New pipelines the same way: queued for the creation threads, the draws skipped until
     # one is built - depth-only ones too (no pixel shader: shadows, the depth pass), which were
     # built on the GPU thread, as was the placeholder every other one got first. 529 of the 1014

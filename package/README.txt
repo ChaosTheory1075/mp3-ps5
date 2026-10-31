@@ -49,12 +49,20 @@ SETTINGS  DISC              which disc the game starts on (it asks for disc 2
           LANGUAGE          English, French, German, Spanish, Italian,
                             Brazilian Portuguese, Polish or Russian text and
                             subtitles.
+          BUTTON ICONS      PlayStation (the PS3 version's) or Xbox.
+          SKIP ANY CUTSCENE the skip button also skips the cutscenes the game
+                            locks; their last seconds still play.
+          SKIP INTRO        no Rockstar logo movie at the start.
+          DUALSENSE         the light bar (Max's health, hits, painkillers,
+                            bullet time), adaptive triggers and added rumble;
+                            FEEDBACK STRENGTH low, medium or high.
           FRAME RATE        60 or 30 locked (the Xbox 360's).
           HD TEXTURES       the textures/ folder's HD textures, if installed.
           ANTI-ALIASING     off or FXAA.
           TEXTURE FILTERING 2x to 16x anisotropic.
           GPU HELPER        a second graphics thread (on); turn it off if
                             something draws wrong.
+          FPS COUNTER       off, simple or detailed, in the top-left corner.
           MENU MUSIC        the menu song's level.
 TROPHIES  every achievement, earned ones first, with their dates (filled in
           once the game has been started once).

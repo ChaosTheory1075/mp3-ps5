@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/input/sony_feedback.h>
 #include <rex/logging.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
@@ -63,7 +64,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // (in the reports SEND LOGS makes)
-constexpr const char* kAppVersion = "1.0.2";
+constexpr const char* kAppVersion = "1.0.3";
 
 ImFont* g_title = nullptr;
 ImFont* g_item = nullptr;
@@ -162,6 +163,12 @@ struct Settings {
   bool lane = true;   // the GPU's second lane (crackdown_gpu_lane)
   int music = 60;     // the menu song's level, 0..100
   int language = 1;   // the Xbox 360's language ID (user_language): kLanguages
+  bool ps_buttons = true;      // PlayStation button icons (mp3_ps_buttons)
+  bool skip_cutscenes = true;  // the skip button skips every cutscene (mp3_cutscene_skip)
+  bool skip_intro = true;      // no Rockstar logo movie at the start (mp3_skip_intro)
+  bool dualsense = true;       // the light bar, adaptive triggers and added rumble (gta4_sony_*)
+  int dualsense_strength = 2;  // 1..3: low, medium, high (gta4_sony_intensity)
+  int fps_counter = 0;         // 0 off, 1 simple, 2 detailed (mp3_fps_counter)
 
   static constexpr const char* kFilterNames[] = {"", "", "2X", "4X", "8X", "16X"};
   // The disc's languages (the World release: En, Fr, De, Es, It, Ru), by their Xbox 360 IDs.
@@ -195,6 +202,12 @@ struct Settings {
         if (k == "gpu_lane") s.lane = value != 0;
         if (k == "menu_music") s.music = std::clamp(value, 0, 100);
         if (k == "language") s.language = kLanguages[LanguageIndex(value)].id;
+        if (k == "ps_buttons") s.ps_buttons = value != 0;
+        if (k == "skip_cutscenes") s.skip_cutscenes = value != 0;
+        if (k == "skip_intro") s.skip_intro = value != 0;
+        if (k == "dualsense") s.dualsense = value != 0;
+        if (k == "dualsense_strength") s.dualsense_strength = std::clamp(value, 1, 3);
+        if (k == "fps_counter") s.fps_counter = std::clamp(value, 0, 2);
       }
       std::fclose(f);
     }
@@ -210,8 +223,10 @@ struct Settings {
     if (std::FILE* f = std::fopen((app / "menu.ini").string().c_str(), "wb")) {
       std::fprintf(f,
                    "frame_rate = %d\nhd_textures = %d\nfxaa = %d\ntexture_filtering = %d\ngpu_lane = %d\nmenu_music = %d\n"
-                   "language = %d\n",
-                   fps, hd_textures ? 1 : 0, fxaa ? 1 : 0, filter, lane ? 1 : 0, music, language);
+                   "language = %d\nps_buttons = %d\nskip_cutscenes = %d\ndualsense = %d\ndualsense_strength = %d\n"
+                   "fps_counter = %d\nskip_intro = %d\n",
+                   fps, hd_textures ? 1 : 0, fxaa ? 1 : 0, filter, lane ? 1 : 0, music, language, ps_buttons ? 1 : 0,
+                   skip_cutscenes ? 1 : 0, dualsense ? 1 : 0, dualsense_strength, fps_counter, skip_intro ? 1 : 0);
       std::fclose(f);
     }
     if (std::FILE* f = std::fopen((app / "disc.txt").string().c_str(), "wb")) {
@@ -235,6 +250,16 @@ struct Settings {
     rex::cvar::SetFlagByName("crackdown_gpu_lane", lane ? "true" : "false");
     // (the game's text, menus and subtitles follow XGetLanguage: ci/patch_framework.py)
     rex::cvar::SetFlagByName("user_language", std::to_string(language));
+    rex::cvar::SetFlagByName("mp3_ps_buttons", ps_buttons ? "true" : "false");
+    rex::cvar::SetFlagByName("mp3_cutscene_skip", skip_cutscenes ? "true" : "false");
+    rex::cvar::SetFlagByName("mp3_skip_intro", skip_intro ? "true" : "false");
+    // (the DualSense: gta4-ps5's features, fed by the game's state in mp3_game_overlay.cpp; not its
+    // touchpad swipes, which are GTA IV's weapon and radio controls)
+    rex::input::sony::SetFeaturesEnabled(dualsense);
+    rex::cvar::SetFlagByName("gta4_sony_gestures", "false");
+    rex::cvar::SetFlagByName("gta4_sony_intensity",
+                             dualsense_strength == 1 ? "0.3" : dualsense_strength == 3 ? "1.0" : "0.6");
+    rex::cvar::SetFlagByName("mp3_fps_counter", fps_counter == 2 ? "detailed" : fps_counter == 1 ? "simple" : "off");
     REXLOG_INFO("Max Payne 3 menu: disc {}, frame rate {}, HD textures {}, anti-aliasing {}, texture filtering {}, "
                 "the GPU's second lane {}, language {}",
                 disc, fps == 30 ? "30 (locked)" : "60", hd_textures ? "on" : "off", fxaa ? "FXAA" : "off",
@@ -299,7 +324,10 @@ const char* const kPageNames[kPages] = {"HOME", "CONTENT", "SAVES", "SETTINGS", 
 // The saves page's rows: its two actions, then the saves and backups in install/.
 enum SavesRow { kBackupRow, kSendLogsRow, kSavesFirst };
 
-enum SettingsRow { kDisc, kLanguage, kFrameRate, kTextures, kAntiAliasing, kFiltering, kLane, kMusic, kSettingsRows };
+enum SettingsRow {
+  kDisc, kLanguage, kButtons, kSkipCutscenes, kSkipIntro, kDualSense, kDualSenseStrength, kFrameRate, kTextures, kAntiAliasing,
+  kFiltering, kLane, kFpsCounter, kMusic, kSettingsRows
+};
 
 class MenuDialog final : public rex::ui::ImGuiDialog {
  public:
@@ -569,6 +597,22 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
                         true,
                         "The language of the game's text, menus and subtitles: English, French, German, Spanish, "
                         "Italian, Brazilian Portuguese, Polish or Russian. The voices stay in English, as on the Xbox 360."};
+    lines[kButtons] = {"GAMEPLAY", "BUTTON ICONS", settings_.ps_buttons ? "PLAYSTATION" : "XBOX", true,
+                       "The buttons the game shows in its prompts, menus and tutorials. PLAYSTATION uses the PS3 "
+                       "version's icons, which the Xbox 360 disc carries too."};
+    lines[kSkipCutscenes] = {"GAMEPLAY", "SKIP ANY CUTSCENE", settings_.skip_cutscenes ? "ON" : "OFF", true,
+                             "The skip button also skips the cutscenes the game doesn't let you skip. Their last "
+                             "seconds still play, so the story carries on just as after watching them."};
+    lines[kSkipIntro] = {"GAMEPLAY", "SKIP INTRO", settings_.skip_intro ? "ON" : "OFF", true,
+                         "Go straight to the game's menu, without the Rockstar logo movie at the start."};
+    lines[kDualSense] = {"CONTROLLER", "DUALSENSE FEATURES", settings_.dualsense ? "ON" : "OFF", true,
+                         "The light bar follows Max's health: red as it runs low, a flash when he's hit, green for a "
+                         "painkiller, blue in bullet time. The adaptive triggers resist while you aim and kick with "
+                         "each shot, and shots and hits rumble harder."};
+    static constexpr const char* kStrengths[] = {"", "LOW", "MEDIUM", "HIGH"};
+    lines[kDualSenseStrength] = {"CONTROLLER", "FEEDBACK STRENGTH", kStrengths[settings_.dualsense_strength],
+                                 settings_.dualsense,
+                                 "How hard the adaptive triggers push back and how strong the added rumble is."};
     lines[kFrameRate] = {"GRAPHICS", "FRAME RATE", settings_.fps == 30 ? "30 (LOCKED)" : "60", true,
                          "30 locks the game to the Xbox 360's own rate: steady, as Max Payne 3 was made. 60 lets it "
                          "run faster, up to the TV's 60 frames a second, when the PS5 keeps up; the busiest fights "
@@ -589,6 +633,11 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
                     "A second thread that takes part of the graphics work - copying the game's memory for the GPU and "
                     "writing its texture lists - off the thread that sets the frame rate. Turn it off if something "
                     "draws wrong."};
+    static constexpr const char* kCounters[] = {"OFF", "SIMPLE", "DETAILED"};
+    lines[kFpsCounter] = {"GRAPHICS", "FPS COUNTER", kCounters[settings_.fps_counter], true,
+                          "A frame rate counter in the top-left corner of the screen while you play. SIMPLE shows frames a "
+                          "second and the frame time; DETAILED also the slowest frames and a graph of the last two "
+                          "seconds."};
     lines[kMusic] = {"AUDIO", "MENU MUSIC", music, true, "How loud this menu's song is.", true};
     return lines;
   }
@@ -605,6 +654,27 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
         settings_.language = Settings::kLanguages[i].id;
         break;
       }
+      case kButtons:
+        if (flip) settings_.ps_buttons = !settings_.ps_buttons;
+        break;
+      case kSkipCutscenes:
+        if (flip) settings_.skip_cutscenes = !settings_.skip_cutscenes;
+        break;
+      case kSkipIntro:
+        if (flip) settings_.skip_intro = !settings_.skip_intro;
+        break;
+      case kDualSense:
+        if (flip) settings_.dualsense = !settings_.dualsense;
+        break;
+      case kDualSenseStrength:
+        if (!settings_.dualsense) break;
+        if (cross) settings_.dualsense_strength = settings_.dualsense_strength % 3 + 1;
+        settings_.dualsense_strength = std::clamp(settings_.dualsense_strength + step, 1, 3);
+        break;
+      case kFpsCounter:
+        if (cross) settings_.fps_counter = (settings_.fps_counter + 1) % 3;
+        settings_.fps_counter = std::clamp(settings_.fps_counter + step, 0, 2);
+        break;
       case kFrameRate:
         if (flip) settings_.fps = settings_.fps == 30 ? 60 : 30;
         break;
@@ -814,6 +884,10 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
     s += std::string(", GPU helper ") + (settings_.lane ? "on" : "off");
     s += std::string(", language ") + Settings::kLanguages[Settings::LanguageIndex(settings_.language)].name;
     s += std::string(", disc ") + (settings_.disc == 2 ? "2" : "1");
+    s += std::string(", ") + (settings_.ps_buttons ? "PlayStation" : "Xbox") + " icons";
+    s += std::string(", skip any cutscene ") + (settings_.skip_cutscenes ? "on" : "off");
+    s += std::string(", DualSense ") + (settings_.dualsense ? "on" : "off");
+    s += std::string(", FPS counter ") + (settings_.fps_counter == 2 ? "detailed" : settings_.fps_counter ? "simple" : "off");
     return s;
   }
 
@@ -1306,19 +1380,31 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
 
   void DrawSettings(ImDrawList* dl, const ImVec2& size) {
     const float u = u_, left = 140 * u + page_dx_;
-    float y = 190 * u;
     const auto lines = SettingsLines();
-    const char* section = nullptr;
+    const float fs = 36 * u, top = 190 * u, bottom = size.y - 120 * u;
+    // where each row and section heading goes (scrolled so the focused row stays in view)
+    std::vector<float> row_y(kSettingsRows, 0.0f), head_y(kSettingsRows, -1.0f);
+    float y = 0;
     for (int r = 0; r < kSettingsRows; ++r) {
-      const SettingLine& l = lines[size_t(r)];
-      if (!section || std::strcmp(section, l.section) != 0) {
-        section = l.section;
+      if (!r || std::strcmp(lines[size_t(r - 1)].section, lines[size_t(r)].section) != 0) {
         if (r) y += 14 * u;
-        Spaced(dl, g_body, 19 * u, ImVec2(left, y), P(kRed), section, 3 * u);
+        head_y[size_t(r)] = y;
         y += 36 * u;
       }
+      row_y[size_t(r)] = y;
+      y += fs + 16 * u;
+    }
+    const float view = bottom - top;
+    const float want = std::clamp(row_y[size_t(row_)] - view * 0.45f, 0.0f, std::max(0.0f, y - view));
+    settings_scroll_ += (want - settings_scroll_) * 0.25f;
+    dl->PushClipRect(ImVec2(0, top - 4 * u), ImVec2(1000 * u + page_dx_, bottom), true);
+    for (int r = 0; r < kSettingsRows; ++r) {
+      const SettingLine& l = lines[size_t(r)];
+      if (head_y[size_t(r)] >= 0)
+        Spaced(dl, g_body, 19 * u, ImVec2(left, top + head_y[size_t(r)] - settings_scroll_), P(kRed), l.section,
+               3 * u);
+      y = top + row_y[size_t(r)] - settings_scroll_;
       const bool sel = r == row_;
-      const float fs = 36 * u;
       const ImU32 col = !l.enabled ? kDim : sel ? kWhite : kGrey;
       if (sel) dl->AddRectFilled(ImVec2(left - 30 * u, y + 8 * u), ImVec2(left - 20 * u, y + fs), P(kRed));
       dl->AddText(g_item, fs, ImVec2(left, y), P(col), l.label);
@@ -1330,8 +1416,8 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
         dl->AddRectFilled(ImVec2(x0, yy - 3 * u), ImVec2(x0 + w * settings_.music / 100.0f, yy + 3 * u),
                           P(sel ? kRed : kGrey));
       }
-      y += fs + 16 * u;
     }
+    dl->PopClipRect();
     // the focused row's help, at the right
     const float px = 1060 * u + page_dx_, pw = 720 * u;
     dl->AddRectFilled(ImVec2(px - 40 * u, 190 * u), ImVec2(px - 39 * u, 760 * u), P(IM_COL32(255, 255, 255, 40)));
@@ -1588,6 +1674,7 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
   int pictures_this_frame_ = 0;
   float time_ = 0, leave_t_ = 0, fade_ = 0, u_ = 1, page_in_ = 1, page_alpha_ = 1, page_dx_ = 0;
   float tab_x_ = 0, tab_w_ = 0, tab_target_x_ = 0, tab_target_w_ = 0, page_dark_ = 0, scroll_ = 0, detail_in_ = 1;
+  float settings_scroll_ = 0;
   bool leaving_ = false, done_ = false;
 };
 
