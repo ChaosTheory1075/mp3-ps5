@@ -16,6 +16,7 @@
 #include "ps5/mp3_game_overlay.h"
 #include "ps5/mp3_install.h"
 #include "ps5/mp3_menu.h"
+#include "ps5/mp3_quick_menu.h"
 #include "ps5/mp3_trophies_game.h"
 
 namespace fs = std::filesystem;
@@ -309,6 +310,8 @@ void Mp3App::OnPostSetup() {
   if (runtime()) mp3ps5::WriteTrophyCatalog(runtime(), runtime()->user_data_root());
   // The frame rate counter and the DualSense's features (ps5/mp3_game_overlay.h).
   mp3ps5::StartGameOverlay(imgui_drawer());
+  // The in-game quick menu, L3 + R3: the cheats (ps5/mp3_quick_menu.h).
+  mp3ps5::StartQuickMenu(imgui_drawer());
 #endif
 }
 
@@ -374,6 +377,10 @@ void Mp3App::OnPreSetup(rex::RuntimeConfig& config) {
   // skipped (ci/patch_framework.py). The frames are shown meanwhile: by default one with a
   // skipped draw wasn't, and the picture froze until every pipeline of a new area was built.
   rex::cvar::SetLaunchFlag("vulkan_async_skip_incomplete_frames", "false");
+  // The stall reporter arms once frames are counted (the FPS counter's NotePresent) and then
+  // samples every thread with SIGPROF on each load; in Crackdown that deadlocked two loads
+  // (13-20 s frozen), and it fired here too (mp3_018.log).
+  rex::cvar::SetLaunchFlag("ps5_hang_reports", "false");
   // Three creation threads, not 3/4 of the CPUs (13): in a burst (96 pipelines in the second
   // from the chapter 1 cutscene to gameplay, mp3_003.log) all of them compiled on the game's
   // cores at once and starved its threads - the pauses, with gaps in the sound at the same

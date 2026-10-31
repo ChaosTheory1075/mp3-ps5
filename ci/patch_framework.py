@@ -495,9 +495,10 @@ def main():
          "  uint32_t taken = 0, seq = 0;\n"
          "  std::chrono::steady_clock::time_point start{};\n"
          "  std::unordered_set<uint64_t> shaders;\n"
+         "  std::unordered_set<uint64_t> buffers;  // (each vertex buffer's bytes once a capture)\n"
          "};\n"
          "Mp3Capture mp3_cap;\n"
-         "constexpr uint32_t kMp3CaptureSeconds[] = {90, 150, 210, 300};\n"
+         "constexpr uint32_t kMp3CaptureSeconds[] = {120, 121, 180, 181, 240, 241};\n"
          "void Mp3CapWrite(const void* p, size_t n) {\n"
          "  if (mp3_cap.file) std::fwrite(p, 1, n, mp3_cap.file);\n"
          "}\n"
@@ -530,9 +531,9 @@ def main():
          "                    unsigned(kMp3CaptureSeconds[mp3_cap.taken]));\n"
          "      mp3_cap.file = std::fopen(path, \"wb\");\n"
          "      mp3_cap.frame = frame;\n      mp3_cap.armed_frame = 0;\n      mp3_cap.seq = 0;\n"
-         "      ++mp3_cap.taken;\n      mp3_cap.shaders.clear();\n"
+         "      ++mp3_cap.taken;\n      mp3_cap.shaders.clear();\n      mp3_cap.buffers.clear();\n"
          "      if (mp3_cap.file) {\n"
-         "        Mp3CapWrite(\"MP3F\", 4);\n        Mp3CapPut(uint32_t(1));\n        Mp3CapPut(frame);\n"
+         "        Mp3CapWrite(\"MP3F\", 4);\n        Mp3CapPut(uint32_t(3));\n        Mp3CapPut(frame);\n"
          "      }\n"
          "    }\n"
          "  }\n"
@@ -575,6 +576,36 @@ def main():
          "                    6 * 4);\n"
          "      }\n"
          "    }\n"
+         "    // (version 2) the vertex shader's: its float and bool constants, its vertex fetch\n"
+         "    // constants and their buffers' bytes as the CPU sees them\n"
+         "    Mp3CapWrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 256 * 16);\n"
+         "    Mp3CapWrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 8 * 4);\n"
+         "    const auto& vbindings = vertex_shader->vertex_bindings();\n"
+         "    Mp3CapPut(uint32_t(vbindings.size()));\n"
+         "    for (const auto& vb : vbindings) {\n"
+         "      const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(vb.fetch_constant);\n"
+         "      Mp3CapPut(vb.fetch_constant);\n      Mp3CapPut(vb.stride_words);\n"
+         "      Mp3CapPut(vf.dword_0);\n      Mp3CapPut(vf.dword_1);\n"
+         "      const uint32_t vaddr = vf.address << 2;\n"
+         "      const uint32_t vsize = std::min(uint32_t(vf.size) << 2, uint32_t(8) << 20);\n"
+         "      const bool first = mp3_cap.buffers.insert((uint64_t(vaddr) << 32) | vsize).second;\n"
+         "      const uint8_t* vdata =\n"
+         "          first && vaddr < 0x20000000u ? memory_->TranslatePhysical(vaddr) : nullptr;\n"
+         "      Mp3CapPut(uint32_t(vdata ? vsize : 0));\n"
+         "      if (vdata) Mp3CapWrite(vdata, vsize);\n"
+         "    }\n"
+         "    // (version 3) the index buffer: format, endianness, count, address, its bytes once\n"
+         "    const uint32_t ibase = index_buffer_info ? index_buffer_info->guest_base : 0;\n"
+         "    const uint32_t ilen = index_buffer_info ? uint32_t(std::min(index_buffer_info->length,\n"
+         "                                                                size_t(4) << 20)) : 0;\n"
+         "    Mp3CapPut(uint32_t(index_buffer_info ? uint32_t(index_buffer_info->format) : 0xFFFFFFFFu));\n"
+         "    Mp3CapPut(uint32_t(index_buffer_info ? uint32_t(index_buffer_info->endianness) : 0));\n"
+         "    Mp3CapPut(index_buffer_info ? index_buffer_info->count : 0u);\n"
+         "    Mp3CapPut(ibase);\n    Mp3CapPut(ilen);\n"
+         "    const bool ifirst = ilen && mp3_cap.buffers.insert((uint64_t(ibase) << 32) | ilen | 1).second;\n"
+         "    const uint8_t* idata = ifirst && ibase < 0x20000000u ? memory_->TranslatePhysical(ibase) : nullptr;\n"
+         "    Mp3CapPut(uint32_t(idata ? ilen : 0));\n"
+         "    if (idata) Mp3CapWrite(idata, ilen);\n"
          "  }\n")
     edit(vcp,
          "    resolve_succeeded = IssueCopy_ReadbackResolvePath();\n  }\n",
@@ -589,6 +620,86 @@ def main():
          "    Mp3CapPut(uint32_t(resolved ? frame_flow_resolve_length_ : 0));\n"
          "    if (resolved) Mp3CapWrite(resolved, frame_flow_resolve_length_);\n"
          "  }\n")
+    # (version 3) After each captured draw, the GPU's own copy (the shared memory buffer) of its
+    # vertex and index buffers, each once a capture ("G" records), to compare with what the CPU
+    # wrote: a stale or wrong GPU copy shows up as a difference.
+    edit(vcp,
+         "        IssueDraw_MemexportReadbackFullPath(memexport_total_size);\n"
+         "      }\n"
+         "    }\n"
+         "  }\n"
+         "\n"
+         "  return true;\n"
+         "}\n",
+         "        IssueDraw_MemexportReadbackFullPath(memexport_total_size);\n"
+         "      }\n"
+         "    }\n"
+         "  }\n"
+         "\n"
+         "  if (Mp3CapActive(frame_current_)) {  // [mp3] frame capture: the GPU's copy of the buffers\n"
+         "    std::vector<std::pair<uint32_t, uint32_t>> mp3_ranges;\n"
+         "    for (const auto& vb : vertex_shader->vertex_bindings()) {\n"
+         "      const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(vb.fetch_constant);\n"
+         "      mp3_ranges.emplace_back(vf.address << 2, std::min(uint32_t(vf.size) << 2, uint32_t(8) << 20));\n"
+         "    }\n"
+         "    if (index_buffer_info && index_buffer_info->guest_base) {\n"
+         "      mp3_ranges.emplace_back(index_buffer_info->guest_base,\n"
+         "                              uint32_t(std::min(index_buffer_info->length, size_t(4) << 20)));\n"
+         "    }\n"
+         "    static std::unordered_set<uint64_t> mp3_gpu_seen;\n"
+         "    static uint64_t mp3_gpu_frame = UINT64_MAX;\n"
+         "    if (mp3_gpu_frame != frame_current_) {\n"
+         "      mp3_gpu_seen.clear();\n      mp3_gpu_frame = frame_current_;\n"
+         "    }\n"
+         "    const ui::vulkan::VulkanDevice* const mp3_device = GetVulkanDevice();\n"
+         "    const ui::vulkan::VulkanDevice::Functions& mp3_dfn = mp3_device->functions();\n"
+         "    for (const auto& [mp3_addr, mp3_size] : mp3_ranges) {\n"
+         "      if (!mp3_size || mp3_addr >= SharedMemory::kBufferSize ||\n"
+         "          mp3_size > SharedMemory::kBufferSize - mp3_addr ||\n"
+         "          !mp3_gpu_seen.insert((uint64_t(mp3_addr) << 32) | mp3_size).second) {\n"
+         "        continue;\n"
+         "      }\n"
+         "      VkBuffer mp3_buffer = VK_NULL_HANDLE;\n"
+         "      VkDeviceMemory mp3_memory = VK_NULL_HANDLE;\n"
+         "      uint32_t mp3_memory_type = UINT32_MAX;\n"
+         "      VkDeviceSize mp3_memory_size = 0;\n"
+         "      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(\n"
+         "              mp3_device, mp3_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,\n"
+         "              ui::vulkan::util::MemoryPurpose::kReadback, mp3_buffer, mp3_memory,\n"
+         "              &mp3_memory_type, &mp3_memory_size)) {\n"
+         "        continue;\n"
+         "      }\n"
+         "      shared_memory_->Use(VulkanSharedMemory::Usage::kRead);\n"
+         "      SubmitBarriers(true);\n"
+         "      VkBufferCopy mp3_region = {};\n"
+         "      mp3_region.srcOffset = mp3_addr;\n"
+         "      mp3_region.size = mp3_size;\n"
+         "      deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), mp3_buffer, 1, &mp3_region);\n"
+         "      PushBufferMemoryBarrier(mp3_buffer, 0, mp3_size, VK_PIPELINE_STAGE_TRANSFER_BIT,\n"
+         "                              VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,\n"
+         "                              VK_ACCESS_HOST_READ_BIT);\n"
+         "      void* mp3_mapping = nullptr;\n"
+         "      if (AwaitAllQueueOperationsCompletion() &&\n"
+         "          mp3_dfn.vkMapMemory(mp3_device->device(), mp3_memory, 0, VK_WHOLE_SIZE, 0, &mp3_mapping) ==\n"
+         "              VK_SUCCESS) {\n"
+         "        if (!(mp3_device->memory_types().host_coherent & (uint32_t(1) << mp3_memory_type))) {\n"
+         "          VkMappedMemoryRange mp3_range = {};\n"
+         "          mp3_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;\n"
+         "          mp3_range.memory = mp3_memory;\n"
+         "          mp3_range.size = VK_WHOLE_SIZE;\n"
+         "          mp3_dfn.vkInvalidateMappedMemoryRanges(mp3_device->device(), 1, &mp3_range);\n"
+         "        }\n"
+         "        Mp3CapWrite(\"G\", 1);\n        Mp3CapPut(mp3_addr);\n        Mp3CapPut(mp3_size);\n"
+         "        Mp3CapWrite(mp3_mapping, mp3_size);\n"
+         "        mp3_dfn.vkUnmapMemory(mp3_device->device(), mp3_memory);\n"
+         "      }\n"
+         "      mp3_dfn.vkDestroyBuffer(mp3_device->device(), mp3_buffer, nullptr);\n"
+         "      mp3_dfn.vkFreeMemory(mp3_device->device(), mp3_memory, nullptr);\n"
+         "    }\n"
+         "  }\n"
+         "\n"
+         "  return true;\n"
+         "}\n")
 
     # A draw whose depth test can never pass and that has stencil off writes
     # nothing (no color, depth or stencil): skip it before it binds render
@@ -686,6 +797,41 @@ def main():
     # random scale. Max Payne 3 reads its HDR scene, bloom and luminance with
     # exp_adjust -13 (+16 above for the integer format): every post-processing
     # pass saw the scene 8 times too dark (the dark, grey gameplay).
+    # Alpha to coverage on the EDRAM path (fragment shader interlock) did nothing on the PS5. The
+    # GPU supports demote-to-helper, and on that path the coverage it computed (in its own branch,
+    # never merged out of it) wasn't merged into the pixel's sample mask, only on the other path:
+    # every alpha-to-coverage draw came out fully covered. The grass around Max fades out by
+    # alpha to coverage (its cards' alpha down to a quarter within a metre of him): drawn solid,
+    # the cards turned into big grass-textured triangles across the screen, worst near the camera
+    # (Chapter V; reported on 1.0.3, there since the EDRAM path). As Xenia canary does it now:
+    # the coverage merged out of its branch, and into the mask on both paths.
+    srb = sdk / "src" / "graphics" / "pipeline" / "shader" / "spirv_translator_rb.cpp"
+    edit(srb,
+         "      SpirvBuilder::IfBuilder if_alpha_to_coverage_enabled(\n"
+         "          builder_->createBinOp(spv::OpINotEqual, type_bool_, alpha_to_mask, const_uint_0_),\n"
+         "          spv::SelectionControlDontFlattenMask, *builder_);\n",
+         "      // [mp3] the mask without alpha to coverage, for the merge after its branch\n"
+         "      const spv::Id fsi_sample_mask_before_alpha_to_coverage = fsi_sample_mask_in_rt_0_alpha_tests;\n"
+         "      SpirvBuilder::IfBuilder if_alpha_to_coverage_enabled(\n"
+         "          builder_->createBinOp(spv::OpINotEqual, type_bool_, alpha_to_mask, const_uint_0_),\n"
+         "          spv::SelectionControlDontFlattenMask, *builder_);\n")
+    edit(srb,
+         "      if_alpha_to_coverage_enabled.makeEndIf();\n"
+         "    }\n",
+         "      if_alpha_to_coverage_enabled.makeEndIf();\n"
+         "      if (edram_fragment_shader_interlock_) {\n"
+         "        // [mp3] out of the branch it was computed in\n"
+         "        fsi_sample_mask_in_rt_0_alpha_tests = if_alpha_to_coverage_enabled.createMergePhi(\n"
+         "            fsi_sample_mask_in_rt_0_alpha_tests, fsi_sample_mask_before_alpha_to_coverage);\n"
+         "      }\n"
+         "    }\n")
+    edit(srb,
+         "      if (!features_.demote_to_helper_invocation) {\n"
+         "        // The tests might have modified the sample mask via\n"
+         "        // fsi_sample_mask_in_rt_0_alpha_tests.\n",
+         "      {  // [mp3] with demote too: alpha to coverage changes the mask either way\n"
+         "        // The tests might have modified the sample mask via\n"
+         "        // fsi_sample_mask_in_rt_0_alpha_tests.\n")
     sft = sdk / "src" / "graphics" / "pipeline" / "shader" / "spirv_translator_fetch.cpp"
     edit(sft,
          "        spv::Id result_exponent_bias = builder_->createBinBuiltinCall(\n"
@@ -839,6 +985,19 @@ def main():
          "#endif\n"
          "  rex::frame_stats::NotePresent();  // [mp3] the frame rate counter (mp3_overlay.cpp)\n"
          "  rex::mp3_perf::Scope mp3_perf_swap(rex::mp3_perf::kSwap);\n")
+    # [mp3] A vertex buffer bound at the address and size it had last time was never requested from
+    # the shared memory again (vertex_buffer_states_ outlived the frame), so the GPU kept its old copy
+    # after the game rewrote it: the grass that bends around Max (rebuilt each frame in buffers the
+    # game reuses) drew another frame's vertices - triangles stretched across the screen (Chapter V,
+    # reported on 1.0.3). Each frame they're requested once again, as in Xenia.
+    edit(vcp,
+         "    shared_memory_->CheckStalePages(uint32_t(REXCVAR_GET(gpu_stale_check_pages_per_frame)));\n"
+         "  }\n"
+         "  vertex_buffers_in_sync_[0] = 0;\n"
+         "  vertex_buffers_in_sync_[1] = 0;\n",
+         "    shared_memory_->CheckStalePages(uint32_t(REXCVAR_GET(gpu_stale_check_pages_per_frame)));\n"
+         "  }\n"
+         "  InvalidateAllVertexBufferResidency();  // [mp3] (the states too: requested again each frame)\n")
 
     # Startup: the shader storage's pipelines were all created before the
     # game started (InitializeShaderStorage blocks the launch), one storage

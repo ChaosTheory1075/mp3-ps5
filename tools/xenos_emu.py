@@ -49,9 +49,11 @@ def swz4(swz):
     return [((swz >> (2 * k)) + k) & 3 for k in range(4)]
 
 
-def run(shader, consts, textures, interp, n, trace=None):
+def run(shader, consts, textures, interp, n, trace=None, program=None, vfetch=None):
     """consts: (256,4); textures: {fetch const: (H,W,4) float array};
-    interp: {reg: (n,4)}. Returns {export reg: (n,4)}, temps."""
+    interp: {reg: (n,4)}. Returns {export reg: (n,4)}, temps.
+    program: the instructions to run instead of shader.program() (xenos_vs.py: bool execs
+    resolved); vfetch(w, R, P, cond): a vertex fetch, which writes R itself."""
     R = np.zeros((64, n, 4), np.float64)
     for r, v in interp.items():
         R[r] = v
@@ -59,9 +61,12 @@ def run(shader, consts, textures, interp, n, trace=None):
     ps = np.zeros(n)
     exports = {}
     with np.errstate(all="ignore"):
-        for kind, w, cond in shader.program():
+        for kind, w, cond in (program if program is not None else shader.program()):
             if kind == "F":
                 op = b(w[0], 0, 5)
+                if op == 0 and vfetch is not None:
+                    vfetch(w, R, P, cond)
+                    continue
                 if op != 1:
                     continue
                 src, dst, const = b(w[0], 5, 6), b(w[0], 12, 6), b(w[0], 20, 5)

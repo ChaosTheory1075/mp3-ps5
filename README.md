@@ -20,6 +20,8 @@ Max Payne 3 for the Xbox 360.
   triggers for aiming and each shot, and added rumble
 - Skip any cutscene (as Fusion Fix does on the PC) and skip the intro logo
 - An FPS counter (simple or detailed)
+- A cheat menu in the game: press both sticks in (L3 + R3) for god mode, infinite ammo, infinite
+  bullet time, one-shot kills and enemies that ignore you (single player)
 - Both discs, and the DLC
 - The game's achievements as PS5-style trophies, with their own page in the menu
 - Installs the discs, Title Update 9, the DLC and the HD textures from your own files, at the drive's

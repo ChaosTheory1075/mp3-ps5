@@ -109,9 +109,12 @@ def to_rgb(pixels, fmt, width, height, dest_swap):
 def read(path):
     f = open(path, "rb").read()
     assert f[:4] == b"MP3F", "not a frame capture"
+    version = struct.unpack_from("<I", f, 4)[0]
     frame = struct.unpack_from("<Q", f, 8)[0]
     p = 16
     shaders, records = {}, []
+    buffers = {}  # (version 2) vertex buffer bytes by (address, size), each written once
+    gpu_buffers = {}  # (version 3) the GPU's copies, by (address, size)
     while p < len(f):
         tag = f[p:p + 1]
         p += 1
@@ -133,8 +136,35 @@ def read(path):
                 fc = struct.unpack_from("<I", f, p)[0]
                 fetches.append((fc, struct.unpack_from("<6I", f, p + 4)))
                 p += 28
+            extra = {}
+            if version >= 2:
+                # the vertex shader's float and bool constants, vertex fetch constants and buffers
+                extra["vs_consts"] = np.frombuffer(f, "<f4", 1024, p).reshape(256, 4)
+                extra["bools"] = struct.unpack_from("<8I", f, p + 4096)
+                p += 4096 + 32
+                n = struct.unpack_from("<I", f, p)[0]
+                p += 4
+                vfetches = []
+                for _ in range(n):
+                    fc, stride, d0, d1, length = struct.unpack_from("<5I", f, p)
+                    p += 20
+                    key = (d0 & ~3, min((d1 >> 2 & 0xFFFFFF) << 2, 8 << 20))
+                    if length:
+                        buffers[key] = f[p:p + length]
+                        p += length
+                    vfetches.append(dict(fc=fc, stride=stride, dwords=(d0, d1), key=key))
+                extra["vfetches"] = vfetches
+            if version >= 3:
+                # the index buffer (format 0 16-bit, 1 32-bit; 0xFFFFFFFF none), its bytes once
+                ifmt, iend, icount, ibase, ilen, n = struct.unpack_from("<6I", f, p)
+                p += 24
+                key = ("i", ibase, ilen)
+                if n:
+                    buffers[key] = f[p:p + n]
+                    p += n
+                extra["index"] = dict(format=ifmt, endian=iend, count=icount, key=key)
             records.append(("D", seq, regs, dict(prim=prim, count=count, vs=vs, ps=ps,
-                                                  consts=consts, fetches=fetches)))
+                                                  consts=consts, fetches=fetches, **extra)))
         elif tag == b"C":
             seq = struct.unpack_from("<I", f, p)[0]
             regs = dict(zip(REGS, struct.unpack_from("<14I", f, p + 4)))
@@ -142,8 +172,16 @@ def read(path):
             p += 72
             records.append(("C", seq, regs, dict(ok=ok, addr=addr, data=f[p:p + length])))
             p += length
+        elif tag == b"G":
+            # (version 3) the GPU's copy of a buffer, read back after the draw that used it
+            addr, size = struct.unpack_from("<II", f, p)
+            p += 8
+            gpu_buffers[(addr, size)] = f[p:p + size]
+            p += size
         else:
             raise SystemExit(f"bad record {tag!r} at {p - 1}")
+    read.buffers = buffers
+    read.gpu_buffers = gpu_buffers
     return frame, shaders, records
 
 

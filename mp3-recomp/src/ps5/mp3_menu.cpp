@@ -64,7 +64,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // (in the reports SEND LOGS makes)
-constexpr const char* kAppVersion = "1.0.3";
+constexpr const char* kAppVersion = "1.0.4";
 
 ImFont* g_title = nullptr;
 ImFont* g_item = nullptr;
@@ -166,6 +166,7 @@ struct Settings {
   bool ps_buttons = true;      // PlayStation button icons (mp3_ps_buttons)
   bool skip_cutscenes = true;  // the skip button skips every cutscene (mp3_cutscene_skip)
   bool skip_intro = true;      // no Rockstar logo movie at the start (mp3_skip_intro)
+  bool cheat_menu = true;      // L3 + R3 opens the in-game quick menu (mp3_quick_menu)
   bool dualsense = true;       // the light bar, adaptive triggers and added rumble (gta4_sony_*)
   int dualsense_strength = 2;  // 1..3: low, medium, high (gta4_sony_intensity)
   int fps_counter = 0;         // 0 off, 1 simple, 2 detailed (mp3_fps_counter)
@@ -205,6 +206,7 @@ struct Settings {
         if (k == "ps_buttons") s.ps_buttons = value != 0;
         if (k == "skip_cutscenes") s.skip_cutscenes = value != 0;
         if (k == "skip_intro") s.skip_intro = value != 0;
+        if (k == "cheat_menu") s.cheat_menu = value != 0;
         if (k == "dualsense") s.dualsense = value != 0;
         if (k == "dualsense_strength") s.dualsense_strength = std::clamp(value, 1, 3);
         if (k == "fps_counter") s.fps_counter = std::clamp(value, 0, 2);
@@ -224,9 +226,10 @@ struct Settings {
       std::fprintf(f,
                    "frame_rate = %d\nhd_textures = %d\nfxaa = %d\ntexture_filtering = %d\ngpu_lane = %d\nmenu_music = %d\n"
                    "language = %d\nps_buttons = %d\nskip_cutscenes = %d\ndualsense = %d\ndualsense_strength = %d\n"
-                   "fps_counter = %d\nskip_intro = %d\n",
+                   "fps_counter = %d\nskip_intro = %d\ncheat_menu = %d\n",
                    fps, hd_textures ? 1 : 0, fxaa ? 1 : 0, filter, lane ? 1 : 0, music, language, ps_buttons ? 1 : 0,
-                   skip_cutscenes ? 1 : 0, dualsense ? 1 : 0, dualsense_strength, fps_counter, skip_intro ? 1 : 0);
+                   skip_cutscenes ? 1 : 0, dualsense ? 1 : 0, dualsense_strength, fps_counter, skip_intro ? 1 : 0,
+                   cheat_menu ? 1 : 0);
       std::fclose(f);
     }
     if (std::FILE* f = std::fopen((app / "disc.txt").string().c_str(), "wb")) {
@@ -253,6 +256,7 @@ struct Settings {
     rex::cvar::SetFlagByName("mp3_ps_buttons", ps_buttons ? "true" : "false");
     rex::cvar::SetFlagByName("mp3_cutscene_skip", skip_cutscenes ? "true" : "false");
     rex::cvar::SetFlagByName("mp3_skip_intro", skip_intro ? "true" : "false");
+    rex::cvar::SetFlagByName("mp3_quick_menu", cheat_menu ? "true" : "false");
     // (the DualSense: gta4-ps5's features, fed by the game's state in mp3_game_overlay.cpp; not its
     // touchpad swipes, which are GTA IV's weapon and radio controls)
     rex::input::sony::SetFeaturesEnabled(dualsense);
@@ -325,7 +329,7 @@ const char* const kPageNames[kPages] = {"HOME", "CONTENT", "SAVES", "SETTINGS", 
 enum SavesRow { kBackupRow, kSendLogsRow, kSavesFirst };
 
 enum SettingsRow {
-  kDisc, kLanguage, kButtons, kSkipCutscenes, kSkipIntro, kDualSense, kDualSenseStrength, kFrameRate, kTextures, kAntiAliasing,
+  kDisc, kLanguage, kButtons, kSkipCutscenes, kSkipIntro, kCheatMenu, kDualSense, kDualSenseStrength, kFrameRate, kTextures, kAntiAliasing,
   kFiltering, kLane, kFpsCounter, kMusic, kSettingsRows
 };
 
@@ -605,6 +609,10 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
                              "seconds still play, so the story carries on just as after watching them."};
     lines[kSkipIntro] = {"GAMEPLAY", "SKIP INTRO", settings_.skip_intro ? "ON" : "OFF", true,
                          "Go straight to the game's menu, without the Rockstar logo movie at the start."};
+    lines[kCheatMenu] = {"GAMEPLAY", "CHEAT MENU (L3 + R3)", settings_.cheat_menu ? "ON" : "OFF", true,
+                         "In the game, press both sticks in (L3 + R3) for the quick menu: god mode, infinite "
+                         "ammo, infinite bullet time, one-shot kills and enemies that ignore you, the FPS counter "
+                         "and the DualSense features. The cheats work in single player only."};
     lines[kDualSense] = {"CONTROLLER", "DUALSENSE FEATURES", settings_.dualsense ? "ON" : "OFF", true,
                          "The light bar follows Max's health: red as it runs low, a flash when he's hit, green for a "
                          "painkiller, blue in bullet time. The adaptive triggers resist while you aim and kick with "
@@ -662,6 +670,9 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
         break;
       case kSkipIntro:
         if (flip) settings_.skip_intro = !settings_.skip_intro;
+        break;
+      case kCheatMenu:
+        if (flip) settings_.cheat_menu = !settings_.cheat_menu;
         break;
       case kDualSense:
         if (flip) settings_.dualsense = !settings_.dualsense;

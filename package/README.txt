@@ -53,6 +53,11 @@ SETTINGS  DISC              which disc the game starts on (it asks for disc 2
           SKIP ANY CUTSCENE the skip button also skips the cutscenes the game
                             locks; their last seconds still play.
           SKIP INTRO        no Rockstar logo movie at the start.
+          CHEAT MENU        in the game, L3 + R3 (both sticks pressed in) opens
+                            the quick menu: god mode, infinite ammo, infinite
+                            bullet time, one-shot kills, enemies that ignore
+                            you (single player), the FPS counter and the
+                            DualSense features.
           DUALSENSE         the light bar (Max's health, hits, painkillers,
                             bullet time), adaptive triggers and added rumble;
                             FEEDBACK STRENGTH low, medium or high.
