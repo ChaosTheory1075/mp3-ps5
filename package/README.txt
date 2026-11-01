@@ -63,7 +63,10 @@ SETTINGS  DISC              which disc the game starts on (it asks for disc 2
                             FEEDBACK STRENGTH low, medium or high.
           FRAME RATE        60 or 30 locked (the Xbox 360's).
           HD TEXTURES       the textures/ folder's HD textures, if installed.
-          ANTI-ALIASING     off or FXAA.
+          UPSCALING         FSR 1 (AMD's upscaler: a sharp picture on a 4K TV,
+                            at no cost to the frame rate) or bilinear.
+          SHARPNESS         FSR 1's sharpening: low, medium or high.
+          ANTI-ALIASING     SMAA, FXAA or off.
           TEXTURE FILTERING 2x to 16x anisotropic.
           GPU HELPER        a second graphics thread (on); turn it off if
                             something draws wrong.
@@ -112,6 +115,8 @@ Liberty Recompiled and vaduur's LibertyRecompAndroid, ReXGlue and Xenia.
 HD textures from mdsxxx1's Max Payne 3 Texture Pack V4 on Nexus Mods (with
 ElPicoleto's blood effects), built on the PS5 from your own download.
 Hover music made with BlackBearReloaded's PS5 AT9 Converter.
+SMAA by Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro and
+Diego Gutierrez (MIT); upscaling by AMD FidelityFX FSR 1.
 Special thanks to Rockstar Games and Remedy Entertainment, for Max Payne.
 
 Max Payne and all related names belong to their owners. This project is not

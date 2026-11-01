@@ -64,7 +64,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // (in the reports SEND LOGS makes)
-constexpr const char* kAppVersion = "1.0.4";
+constexpr const char* kAppVersion = "1.0.5";
 
 ImFont* g_title = nullptr;
 ImFont* g_item = nullptr;
@@ -157,8 +157,12 @@ class Pad {
 struct Settings {
   int disc = 1;  // 1 or 2
   int fps = 30;  // 30 (locked, the Xbox 360's) or 60
+  // (Drawn at the Xbox 360's 720p always: 2x (1440p) ran at 20-40 fps on the EDRAM path, and 3x
+  // drew a black scene. The picture is upscaled to the TV instead.)
+  bool fsr = true;  // the picture's stretch to the TV's resolution: FSR 1 (present_effect fsr) or bilinear
+  int sharpness = 3;  // FSR 1's sharpening (present_fsr_sharpness_reduction): 1 low, 2 medium, 3 high
   bool hd_textures = true;
-  bool fxaa = false;  // swap_post_effect: none or fxaa
+  int aa = 2;  // swap_post_effect: 0 none, 1 fxaa, 2 smaa
   int filter = 3;     // anisotropic_override 2..5: 2x, 4x, 8x, 16x
   bool lane = true;   // the GPU's second lane (crackdown_gpu_lane)
   int music = 60;     // the menu song's level, 0..100
@@ -172,6 +176,10 @@ struct Settings {
   int fps_counter = 0;         // 0 off, 1 simple, 2 detailed (mp3_fps_counter)
 
   static constexpr const char* kFilterNames[] = {"", "", "2X", "4X", "8X", "16X"};
+  static constexpr const char* kAaNames[] = {"OFF", "FXAA", "SMAA"};
+  static constexpr const char* kSharpnessNames[] = {"", "LOW", "MEDIUM", "HIGH"};
+  // FSR 1's RCAS sharpness reduction in stops (0 = sharpest) for each sharpness.
+  static constexpr const char* kSharpnessStops[] = {"", "1.0", "0.5", "0.2"};
   // The disc's languages (the World release: En, Fr, De, Es, It, Ru), by their Xbox 360 IDs.
   struct Language {
     int id;
@@ -197,8 +205,11 @@ struct Settings {
         const std::string k(key);
         if (k == "frame_rate") s.fps = value == 60 ? 60 : 30;
         if (k == "frame_rate_unlocked") s.fps = value ? 60 : 30;  // (the earlier menu's)
+        if (k == "upscaling_fsr") s.fsr = value != 0;
+        if (k == "fsr_sharpness") s.sharpness = std::clamp(value, 1, 3);
         if (k == "hd_textures") s.hd_textures = value != 0;
-        if (k == "fxaa") s.fxaa = value != 0;
+        if (k == "fxaa" && value) s.aa = 1;  // (the earlier on/off row's: FXAA kept for whoever chose it)
+        if (k == "anti_aliasing") s.aa = std::clamp(value, 0, 2);
         if (k == "texture_filtering") s.filter = std::clamp(value, 2, 5);
         if (k == "gpu_lane") s.lane = value != 0;
         if (k == "menu_music") s.music = std::clamp(value, 0, 100);
@@ -224,12 +235,12 @@ struct Settings {
   void Save(const fs::path& app) const {
     if (std::FILE* f = std::fopen((app / "menu.ini").string().c_str(), "wb")) {
       std::fprintf(f,
-                   "frame_rate = %d\nhd_textures = %d\nfxaa = %d\ntexture_filtering = %d\ngpu_lane = %d\nmenu_music = %d\n"
+                   "frame_rate = %d\nhd_textures = %d\nanti_aliasing = %d\ntexture_filtering = %d\ngpu_lane = %d\nmenu_music = %d\n"
                    "language = %d\nps_buttons = %d\nskip_cutscenes = %d\ndualsense = %d\ndualsense_strength = %d\n"
-                   "fps_counter = %d\nskip_intro = %d\ncheat_menu = %d\n",
-                   fps, hd_textures ? 1 : 0, fxaa ? 1 : 0, filter, lane ? 1 : 0, music, language, ps_buttons ? 1 : 0,
+                   "fps_counter = %d\nskip_intro = %d\ncheat_menu = %d\nupscaling_fsr = %d\nfsr_sharpness = %d\n",
+                   fps, hd_textures ? 1 : 0, aa, filter, lane ? 1 : 0, music, language, ps_buttons ? 1 : 0,
                    skip_cutscenes ? 1 : 0, dualsense ? 1 : 0, dualsense_strength, fps_counter, skip_intro ? 1 : 0,
-                   cheat_menu ? 1 : 0);
+                   cheat_menu ? 1 : 0, fsr ? 1 : 0, sharpness);
       std::fclose(f);
     }
     if (std::FILE* f = std::fopen((app / "disc.txt").string().c_str(), "wb")) {
@@ -240,15 +251,19 @@ struct Settings {
 
   // The cvars they set, for this start.
   void Apply() const {
-    // (the Xbox 360's own resolution, always: 2x cost the PS5 far more than it showed)
+    // (the Xbox 360's own resolution, always: see `fsr` above)
     rex::cvar::SetFlagByName("draw_resolution_scale_x", "1");
     rex::cvar::SetFlagByName("draw_resolution_scale_y", "1");
+    // (read by the presenter when it starts, before this menu: Mp3App hands them over too)
+    rex::cvar::SetFlagByName("present_effect", fsr ? "fsr" : "bilinear");
+    rex::cvar::SetFlagByName("present_fsr_sharpness_reduction", kSharpnessStops[sharpness]);
     rex::cvar::SetFlagByName("hd_textures", hd_textures ? "true" : "false");
     // The game's frame lock (mp3_app.cpp): 2 vblanks a frame, as on the Xbox
     // 360, or 1. The guest's vblanks follow the TV's 60 Hz either way.
     rex::cvar::SetFlagByName("mp3_frame_lock", fps == 30 ? "2" : "1");
     rex::cvar::SetFlagByName("vsync", "true");
-    rex::cvar::SetFlagByName("swap_post_effect", fxaa ? "fxaa" : "none");
+    // (SMAA: ci/fw-files/src/graphics/vulkan/mp3_smaa.cpp)
+    rex::cvar::SetFlagByName("swap_post_effect", aa == 2 ? "smaa" : aa == 1 ? "fxaa" : "none");
     rex::cvar::SetFlagByName("anisotropic_override", std::to_string(filter));
     rex::cvar::SetFlagByName("crackdown_gpu_lane", lane ? "true" : "false");
     // (the game's text, menus and subtitles follow XGetLanguage: ci/patch_framework.py)
@@ -264,9 +279,11 @@ struct Settings {
     rex::cvar::SetFlagByName("gta4_sony_intensity",
                              dualsense_strength == 1 ? "0.3" : dualsense_strength == 3 ? "1.0" : "0.6");
     rex::cvar::SetFlagByName("mp3_fps_counter", fps_counter == 2 ? "detailed" : fps_counter == 1 ? "simple" : "off");
-    REXLOG_INFO("Max Payne 3 menu: disc {}, frame rate {}, HD textures {}, anti-aliasing {}, texture filtering {}, "
-                "the GPU's second lane {}, language {}",
-                disc, fps == 30 ? "30 (locked)" : "60", hd_textures ? "on" : "off", fxaa ? "FXAA" : "off",
+    REXLOG_INFO("Max Payne 3 menu: disc {}, frame rate {}, upscaling {} (sharpness {}), HD textures {}, "
+                "anti-aliasing {}, texture filtering {}, the GPU's second lane {}, language {}",
+                disc, fps == 30 ? "30 (locked)" : "60", fsr ? "FSR 1" : "bilinear",
+                fsr ? kSharpnessNames[sharpness] : "-", hd_textures ? "on" : "off",
+                kAaNames[aa],
                 kFilterNames[filter], lane ? "on" : "off", kLanguages[LanguageIndex(language)].name);
   }
 };
@@ -329,7 +346,7 @@ const char* const kPageNames[kPages] = {"HOME", "CONTENT", "SAVES", "SETTINGS", 
 enum SavesRow { kBackupRow, kSendLogsRow, kSavesFirst };
 
 enum SettingsRow {
-  kDisc, kLanguage, kButtons, kSkipCutscenes, kSkipIntro, kCheatMenu, kDualSense, kDualSenseStrength, kFrameRate, kTextures, kAntiAliasing,
+  kDisc, kLanguage, kButtons, kSkipCutscenes, kSkipIntro, kCheatMenu, kDualSense, kDualSenseStrength, kFrameRate, kUpscaling, kSharpness, kTextures, kAntiAliasing,
   kFiltering, kLane, kFpsCounter, kMusic, kSettingsRows
 };
 
@@ -625,14 +642,23 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
                          "30 locks the game to the Xbox 360's own rate: steady, as Max Payne 3 was made. 60 lets it "
                          "run faster, up to the TV's 60 frames a second, when the PS5 keeps up; the busiest fights "
                          "may dip below it."};
+    lines[kUpscaling] = {"GRAPHICS", "UPSCALING", settings_.fsr ? "FSR 1" : "BILINEAR", true,
+                         "How the picture is enlarged to your TV's resolution (up to 4K). FSR 1, AMD's upscaler, keeps "
+                         "edges and detail sharp at almost no cost to the frame rate; BILINEAR is a plain, softer "
+                         "stretch."};
+    lines[kSharpness] = {"GRAPHICS", "SHARPNESS", settings_.fsr ? Settings::kSharpnessNames[settings_.sharpness] : "-",
+                         settings_.fsr,
+                         "How much FSR 1 sharpens the enlarged picture. HIGH is crispest but can make edges and "
+                         "film grain look harsh; LOW is gentler."};
     lines[kTextures] = {"GRAPHICS", "HD TEXTURES", has_textures_ ? (settings_.hd_textures ? "ON" : "OFF") : "NOT INSTALLED",
                         has_textures_,
                         has_textures_ ? "The high resolution textures in the app's textures/ folder, in place of the "
                                         "Xbox 360's."
                                       : "Put a converted texture pack in the app's textures/ folder to use it here."};
-    lines[kAntiAliasing] = {"GRAPHICS", "ANTI-ALIASING", settings_.fxaa ? "FXAA" : "OFF", true,
-                            "FXAA smooths the jagged edges of the picture as it goes to the screen. It costs the PS5's "
-                            "GPU a little and blurs fine detail slightly."};
+    lines[kAntiAliasing] = {"GRAPHICS", "ANTI-ALIASING", Settings::kAaNames[settings_.aa], true,
+                            "Smooths jagged edges before the picture is enlarged. SMAA finds edges by their shape and "
+                            "keeps the rest sharp; FXAA is a little cheaper but blurs fine detail. Both cost the "
+                            "PS5's GPU very little."};
     lines[kFiltering] = {"GRAPHICS", "TEXTURE FILTERING",
                          std::string(Settings::kFilterNames[settings_.filter]) + " ANISOTROPIC", true,
                          "How sharp floors, walls and streets stay when seen at an angle. Higher is sharper; the PS5's "
@@ -689,11 +715,20 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
       case kFrameRate:
         if (flip) settings_.fps = settings_.fps == 30 ? 60 : 30;
         break;
+      case kSharpness:
+        if (!settings_.fsr) break;
+        if (cross) settings_.sharpness = settings_.sharpness % 3 + 1;
+        settings_.sharpness = std::clamp(settings_.sharpness + step, 1, 3);
+        break;
+      case kUpscaling:
+        if (flip) settings_.fsr = !settings_.fsr;
+        break;
       case kTextures:
         if (flip && has_textures_) settings_.hd_textures = !settings_.hd_textures;
         break;
       case kAntiAliasing:
-        if (flip) settings_.fxaa = !settings_.fxaa;
+        if (cross) settings_.aa = (settings_.aa + 1) % 3;
+        settings_.aa = std::clamp(settings_.aa + step, 0, 2);
         break;
       case kFiltering:
         if (cross) settings_.filter = settings_.filter == 5 ? 2 : settings_.filter + 1;
@@ -889,8 +924,10 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
   // The settings, for the report ("60 FPS, HD textures on, ...").
   std::string SettingsSummary() const {
     std::string s = settings_.fps == 30 ? "30 FPS (locked)" : "60 FPS";
+    s += std::string(", upscaling ") + (settings_.fsr ? "FSR 1" : "bilinear");
+    if (settings_.fsr) s += std::string(" (sharpness ") + Settings::kSharpnessNames[settings_.sharpness] + ")";
     s += std::string(", HD textures ") + (has_textures_ ? (settings_.hd_textures ? "on" : "off") : "not installed");
-    s += std::string(", anti-aliasing ") + (settings_.fxaa ? "FXAA" : "off");
+    s += std::string(", anti-aliasing ") + Settings::kAaNames[settings_.aa];
     s += std::string(", filtering ") + Settings::kFilterNames[settings_.filter];
     s += std::string(", GPU helper ") + (settings_.lane ? "on" : "off");
     s += std::string(", language ") + Settings::kLanguages[Settings::LanguageIndex(settings_.language)].name;
@@ -1614,7 +1651,8 @@ class MenuDialog final : public rex::ui::ImGuiDialog {
     py += 36 * u;
     dl->AddText(g_body, 22 * u, ImVec2(px, py), P(kGrey),
                 "PS5 Payload SDK  /  Mesa RADV (Vulkan)  /  Dear ImGui\nstb_image, dr_mp3, zlib, xxHash  /  Oswald and "
-                "Inter (SIL Open Font License)\nBlackBearReloaded's PS5 AT9 Converter (the home screen music)",
+                "Inter (SIL Open Font License)\nBlackBearReloaded's PS5 AT9 Converter (the home screen music)\n"
+                "SMAA (Jimenez, Echevarria, Masia, Navarro, Gutierrez)  /  AMD FidelityFX FSR 1",
                 nullptr, pw);
   }
 

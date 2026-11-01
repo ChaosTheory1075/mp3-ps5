@@ -11,6 +11,8 @@
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
+#include <rex/system/interfaces/graphics.h>
+#include <rex/ui/presenter.h>
 
 #include "mp3_init.h"
 #include "ps5/mp3_game_overlay.h"
@@ -20,6 +22,9 @@
 #include "ps5/mp3_trophies_game.h"
 
 namespace fs = std::filesystem;
+
+REXCVAR_DECLARE(std::string, present_effect);  // (the presenter's, ui/presenter.cpp)
+REXCVAR_DECLARE(double, present_fsr_sharpness_reduction);
 
 namespace {
 
@@ -99,7 +104,20 @@ std::optional<rex::PathConfig> Mp3App::OnFinalizePaths(const rex::PathConfig& de
   // The menu first (mp3_menu.cpp); PLAY carries on with the start, on the
   // disc it chose (disc.txt).
   mp3ps5::ShowMenu(imgui_drawer(), immediate_drawer(), AppRoot(defaults),
-                   [defaults, resume](mp3ps5::MenuChoice) { resume(ResolvePaths(defaults)); });
+                   [this, defaults, resume](mp3ps5::MenuChoice) {
+                     // The UPSCALING setting (present_effect, set by the menu): the window's presenter
+                     // read it when it started, before the menu, so it gets it here (on the UI thread).
+                     if (rex::ui::Presenter* presenter =
+                             graphics_system() ? graphics_system()->presenter() : nullptr) {
+                       using Config = rex::ui::Presenter::GuestOutputPaintConfig;
+                       Config config = presenter->GetGuestOutputPaintConfigFromUIThread();
+                       config.SetEffect(REXCVAR_GET(present_effect) == "fsr" ? Config::Effect::kFsr
+                                                                             : Config::Effect::kBilinear);
+                       config.SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
+                       presenter->SetGuestOutputPaintConfigFromUIThread(config);
+                     }
+                     resume(ResolvePaths(defaults));
+                   });
   return std::nullopt;
 #else
   (void)resume;

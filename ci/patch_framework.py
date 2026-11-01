@@ -110,6 +110,75 @@ def main():
     edit(gfx,
          "    vulkan/texture_cache.cpp\n",
          "    vulkan/texture_cache.cpp\n    vulkan/hd_textures.cpp\n")
+    # The graphics system (its presenter), for the app: the menu's UPSCALING
+    # setting goes to the presenter, which took present_effect at its start,
+    # before the menu (mp3_app.cpp).
+    edit(sdk / "include" / "rex" / "rex_app.h",
+         "  ui::Window* window() const { return window_.get(); }\n",
+         "  ui::Window* window() const { return window_.get(); }\n"
+         "  system::IGraphicsSystem* graphics_system() const { return config_.graphics.get(); }  // [mp3]\n")
+    # SMAA 1x as a swap post effect (swap_post_effect smaa: ci/fw-files/src/graphics/vulkan/
+    # mp3_smaa.cpp, shaders from tools/smaa). It runs where FXAA does, on the same gamma-corrected
+    # source image, before the presenter's upscaling (FSR 1): SMAA cleans the edges with less blur
+    # than FXAA, so the upscaler doesn't enlarge the jaggies. FXAA stays the fallback.
+    edit(sdk / "include" / "rex" / "graphics" / "command_processor.h",
+         "    kFxaaExtreme,\n  };\n",
+         "    kFxaaExtreme,\n    kSmaa,  // [mp3]\n  };\n")
+    edit(sdk / "src" / "graphics" / "graphics_system.cpp",
+         "    .allowed({\"none\", \"fxaa\", \"fxaa_extreme\"})\n",
+         "    .allowed({\"none\", \"fxaa\", \"fxaa_extreme\", \"smaa\"})  // [mp3]\n")
+    edit(sdk / "src" / "graphics" / "graphics_system.cpp",
+         "  if (lowered == \"fxaa_extreme\" || lowered == \"extreme\") {\n",
+         "  if (lowered == \"smaa\") {  // [mp3]\n"
+         "    return rex::graphics::CommandProcessor::SwapPostEffect::kSmaa;\n"
+         "  }\n"
+         "  if (lowered == \"fxaa_extreme\" || lowered == \"extreme\") {\n")
+    vcph_smaa = sdk / "include" / "rex" / "graphics" / "vulkan" / "command_processor.h"
+    edit(vcph_smaa,
+         "  void BindExternalComputePipeline(VkPipeline pipeline);\n",
+         "  void BindExternalComputePipeline(VkPipeline pipeline);\n"
+         "  // [mp3] SMAA (mp3_smaa.cpp): false if unavailable (FXAA then).\n"
+         "  bool Mp3SmaaRecord(VkImageView color_view, VkImage dest_image, VkImageView dest_view,\n"
+         "                     uint32_t width, uint32_t height, uint32_t frame_index);\n"
+         "  bool Mp3SmaaInitialize();\n"
+         "  void Mp3SmaaShutdown();\n")
+    edit(vcph_smaa,
+         "  VkImageLayout swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;\n",
+         "  VkImageLayout swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;\n"
+         "  struct Mp3Smaa;\n"
+         "  Mp3Smaa* mp3_smaa_ = nullptr;  // [mp3] created on first use\n")
+    vcp_smaa = sdk / "src" / "graphics" / "vulkan" / "command_processor.cpp"
+    edit(vcp_smaa,
+         "        bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||\n"
+         "                        swap_post_effect == SwapPostEffect::kFxaaExtreme;\n",
+         "        bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||\n"
+         "                        swap_post_effect == SwapPostEffect::kFxaaExtreme ||\n"
+         "                        swap_post_effect == SwapPostEffect::kSmaa;  // [mp3] FXAA's source image\n")
+    edit(vcp_smaa,
+         "            BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme\n"
+         "                                            ? swap_fxaa_extreme_pipeline_\n"
+         "                                            : swap_fxaa_pipeline_);\n"
+         "            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);\n",
+         "            if (swap_post_effect != SwapPostEffect::kSmaa ||\n"
+         "                !Mp3SmaaRecord(swap_fxaa_source_image_view_, vulkan_context.image(),\n"
+         "                               vulkan_context.image_view(), guest_output_width,\n"
+         "                               guest_output_height, swap_frame_index)) {  // [mp3]\n"
+         "              BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme\n"
+         "                                              ? swap_fxaa_extreme_pipeline_\n"
+         "                                              : swap_fxaa_pipeline_);\n"
+         "              deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);\n"
+         "            }\n")
+    edit(vcp_smaa,
+         "void VulkanCommandProcessor::ShutdownContext() {\n"
+         "  GpuLane::Get().Drain();  // [crackdown]\n"
+         "  AwaitAllQueueOperationsCompletion();\n",
+         "void VulkanCommandProcessor::ShutdownContext() {\n"
+         "  GpuLane::Get().Drain();  // [crackdown]\n"
+         "  AwaitAllQueueOperationsCompletion();\n"
+         "  Mp3SmaaShutdown();  // [mp3]\n")
+    edit(gfx,
+         "    vulkan/texture_cache.cpp\n    vulkan/hd_textures.cpp\n",
+         "    vulkan/texture_cache.cpp\n    vulkan/hd_textures.cpp\n    vulkan/mp3_smaa.cpp\n")
     tc_h = sdk / "include" / "rex" / "graphics" / "vulkan" / "texture_cache.h"
     edit(tc_h,
          "class VulkanTextureCache final : public TextureCache {\n",

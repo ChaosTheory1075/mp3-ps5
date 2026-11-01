@@ -1,0 +1,16 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// SMAA pass 1: luma edges of the gamma-corrected frame.
+#include "smaa_common.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D color_tex;  // linear
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D edges_out;
+
+void main() {
+  ivec2 pixel;
+  vec2 texcoord;
+  if (!Mp3SmaaPixel(pixel, texcoord)) return;
+  vec4 offset[3];
+  SMAAEdgeDetectionVS(texcoord, offset);
+  imageStore(edges_out, pixel, vec4(SMAALumaEdgeDetectionPS(texcoord, offset, color_tex), 0.0, 0.0));
+}

@@ -14,7 +14,10 @@ Max Payne 3 for the Xbox 360.
 - Max Payne 3 with Title Update 9, recompiled to run natively on the PS5 (not emulated)
 - 60 FPS (the Xbox 360's 30 FPS lock lifted), with a 30 FPS mode
 - The PC version's HD textures, made on the PS5 from the Nexus Mods texture pack
-- FXAA and anisotropic filtering (2x to 16x)
+- A sharper picture on 4K TVs: AMD's FSR 1 upscales the game's 720p to the TV's resolution, after
+  SMAA anti-aliasing smooths its edges, at no cost to the frame rate (FXAA and plain bilinear also
+  available)
+- Anisotropic filtering (2x to 16x)
 - PlayStation button icons (the PS3 version's, which the Xbox 360 disc carries too)
 - DualSense features: the light bar follows Max's health (hits, painkillers, bullet time), adaptive
   triggers for aiming and each shot, and added rumble
@@ -111,6 +114,8 @@ carries, `package/mp3-textures.txt`), `xenos_disasm.py` and `xenos_emu.py` (Xbox
   the HD textures (with **ElPicoleto**'s blood effects and textures from ambientCG). Not included
   here: you download it from the mod's page, and the app builds the textures from it on your PS5
 - **BlackBearReloaded**: the PS5 AT9 Converter (the home screen music)
+- **SMAA** by Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro and Diego Gutierrez
+  (MIT, `tools/smaa/`), and **AMD FidelityFX FSR 1** (the upscaling)
 - Built with the PS5 Payload SDK, Mesa RADV, Dear ImGui, stb_image, dr_mp3, zlib, xxHash, and the
   Oswald and Inter fonts (SIL Open Font License)
 - Special thanks to **Rockstar Games** and **Remedy Entertainment**, for Max Payne
